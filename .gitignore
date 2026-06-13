@@ -6,3 +6,6 @@ llamacpp.log
 
 # old backups
 bkup/
+
+# local scratch / working notes
+todo.md
