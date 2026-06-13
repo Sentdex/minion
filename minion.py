@@ -12,7 +12,7 @@ out of the text — the convention most open models (Hermes/Qwen/Nemotron) emit.
   export MINION_API_KEY=sk-noop                    # any string; local servers ignore it
   python minion.py
 
-Toggles in-session: /yolo (skip confirms)  /compress  /reset  /quit
+Toggles in-session: /yolo (skip confirms)  /compress  /compact  /reset  /quit
 """
 import json
 import os
@@ -794,7 +794,7 @@ def read_multiline(initial="", history=None):
 
 # --- repl -------------------------------------------------------------------
 BANNER = f"""{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}
-{DIM}  {client.base_url}  ·  /yolo /compress /reset /quit  ·  log → llamacpp.log{RESET}"""
+{DIM}  {client.base_url}  ·  /yolo /compress /compact /reset /quit  ·  log → llamacpp.log{RESET}"""
 
 
 def main():
@@ -821,7 +821,7 @@ def main():
             messages = [{"role": "system", "content": SYSTEM}]
             print(f"{DIM}  context cleared{RESET}")
             continue
-        if user == "/compress":
+        if user in ("/compress", "/compact"):
             # nothing to compress if we're under (system + KEEP) turns
             body_len = len(messages) - (1 if messages and messages[0].get("role") == "system" else 0)
             if body_len <= COMPRESS_KEEP:
