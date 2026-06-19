@@ -285,5 +285,5 @@ script (JSONL). Useful for debugging what the model actually saw and returned.
 minion was developed using the following models:
 
 - **minion** (eating its own dog food)
-- [**GLM 5.2**](https://z.ai) (Z.ai) (Open Weights coming soon!)
+- [**GLM 5.2**](https://huggingface.co/zai-org/GLM-5.2) (Z.ai, open weights)
 - [**MiniMax-M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) (MiniMax)
