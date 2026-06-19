@@ -95,13 +95,14 @@ def test_run_tool_propagates_esc():
 #    Drive it with a fake stream that emits two tool calls; escape the first.
 # ---------------------------------------------------------------------------
 class _FakeDelta:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, reasoning=None):
         self.content = content
         self.tool_calls = tool_calls
         self.model_extra = {}
+        self._reasoning = reasoning
     @property
     def reasoning_content(self):
-        return None
+        return self._reasoning
 
 
 class _FakeChoice:
@@ -184,9 +185,7 @@ def test_repl_breaks_on_esc():
     saved_read_multiline = m.read_multiline
     saved_model_turn = m.model_turn
     saved_banner = m._banner
-    saved_paint = m._paint_status_bar
     m._banner = lambda: ""
-    m._paint_status_bar = lambda: None
     m.LifeSpinner = type("NoSpinner", (), {
         "__init__": lambda self, **kw: None,
         "start": lambda self: None,
@@ -195,7 +194,8 @@ def test_repl_breaks_on_esc():
     })
     builtins.print = lambda *a, **k: None
     call_count = {"n": 0}
-    def fake_model_turn(messages, reasoning_loop_cut_count=0):
+    def fake_model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
+                        forced_final=False):
         call_count["n"] += 1
         # first turn: model emits a tool call, user escapes it
         if call_count["n"] == 1:
@@ -216,9 +216,84 @@ def test_repl_breaks_on_esc():
         m.read_multiline = saved_read_multiline
         m.model_turn = saved_model_turn
         m._banner = saved_banner
-        m._paint_status_bar = saved_paint
         builtins.print = _REAL_PRINT
     print("PASS — REPL breaks inner loop on TURN_ESC, no extra model turn")
+
+
+# ---------------------------------------------------------------------------
+# 6. Reasoning-only stalls use the forced-finalizer path
+# ---------------------------------------------------------------------------
+def test_reasoning_only_stall_requests_forced_final():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    saved_limit = m.REASONING_ONLY_CHAR_LIMIT
+    m._interrupt_watcher = lambda: None
+    m.REASONING_ONLY_CHAR_LIMIT = 3
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    chunks = [_FakeChunk(_FakeDelta(reasoning="abcd"))]
+    m.open_stream = lambda messages, **kw: iter(chunks)
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages)
+        assert status == m.TURN_FORCE_FINAL, f"expected TURN_FORCE_FINAL, got {status!r}"
+        assert "visible final answer" in messages[-1]["content"]
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        m.REASONING_ONLY_CHAR_LIMIT = saved_limit
+        builtins.print = _REAL_PRINT
+    print("PASS — reasoning-only stall requests forced final answer")
+
+
+# ---------------------------------------------------------------------------
+# 7. Forced finalizer tool call becomes visible assistant text
+# ---------------------------------------------------------------------------
+def test_forced_final_tool_call_becomes_assistant_text():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    m._interrupt_watcher = lambda: None
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    captured = {}
+
+    def fake_open_stream(messages, **kw):
+        captured.update(kw)
+        args = '{"answer":"forced answer works","status":"answered"}'
+        return iter([_FakeChunk(_FakeDelta(
+            tool_calls=[_FakeTC(0, "final_1", "final_answer", args)]
+        ))])
+
+    m.open_stream = fake_open_stream
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages, forced_final=True)
+        assert status == m.TURN_DONE, f"expected TURN_DONE, got {status!r}"
+        assert captured["tools"] == [m.FINAL_ANSWER_TOOL]
+        assert captured["tool_choice"] == m.FINAL_ANSWER_TOOL_CHOICE
+        assert captured["max_tokens"] == m.FORCED_FINAL_MAX_TOKENS
+        assert messages[-1] == {"role": "assistant", "content": "forced answer works"}
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        builtins.print = _REAL_PRINT
+    print("PASS — forced final_answer tool call becomes assistant text")
 
 
 if __name__ == "__main__":
@@ -227,4 +302,6 @@ if __name__ == "__main__":
     test_run_tool_propagates_esc()
     test_model_turn_native_esc()
     test_repl_breaks_on_esc()
+    test_reasoning_only_stall_requests_forced_final()
+    test_forced_final_tool_call_becomes_assistant_text()
     print("\nALL ESC-APPROVAL TESTS PASSED")

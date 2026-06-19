@@ -29,7 +29,8 @@ def fake_compress(msgs, keep=m.COMPRESS_KEEP):
                {"role": "user", "content": "[Compressed context — 3 earlier turns summarized; last 2 turns kept verbatim]\n\nfake"}]
     return (2, 3, 42)
 
-def fake_model_turn(msgs, reasoning_loop_cut_count=0):
+def fake_model_turn(msgs, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
+                    forced_final=False):
     return False  # no tool calls → REPL moves to next prompt
 
 # capture stdout so we can compare

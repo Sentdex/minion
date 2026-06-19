@@ -34,7 +34,8 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /save [title]                   # save the current session (title optional)
 
 Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /sessions  /resume  /save  /delete  /quit
-Flags: --yolo  --approval <low|medium|high>  --source <name>  --resume <target>  --session <id>
+Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
+Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
 """
 import json
 import os
@@ -49,7 +50,8 @@ import termios
 import threading
 import time
 
-from openai import OpenAI, APIConnectionError
+import httpx
+from openai import OpenAI, APIConnectionError, APIError
 
 # --- env file ---------------------------------------------------------------
 # Load ~/.env (or MINION_ENV_FILE) into os.environ without clobbering vars
@@ -500,14 +502,15 @@ if _start:
 
 
 # --- approval gating --------------------------------------------------------
-# Three risk levels (low < medium < high) plus an implicit "yolo" mode that
-# never prompts. APPROVE_LEVEL is the maximum risk level to AUTO-APPROVE:
+# Three risk levels (low < medium < high) plus an explicit "prompt all" state
+# and YOLO mode. APPROVE_LEVEL is the maximum risk level to AUTO-APPROVE:
 # actions classified at ≤ APPROVE_LEVEL run without prompting; anything
-# strictly above prompts.
+# strictly above prompts. APPROVE_LEVEL=None means prompt for every classified
+# action. YOLO=True short-circuits entirely and skips the classifier call.
+#   None     → prompt low + medium + high
 #   "low"    → auto-approve low (reads, grep, wc); prompt medium + high
 #   "medium" → auto-approve low + medium (edits, cp, mv, tests); prompt high
-#   "high"   → auto-approve everything (never prompts)
-# YOLO=True short-circuits entirely (skips even the risk-classifier call).
+#   "high"   → auto-approve low + medium + high
 LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 # Accept full words and common abbreviations (med, hi, lo, m, h, l …).
@@ -522,17 +525,86 @@ def _normalize_level(arg):
     """Resolve 'med' → 'medium', 'hi' → 'high', etc. Returns the canonical
     level name or None if the input isn't recognised."""
     return _LEVEL_ALIASES.get(arg.lower().strip())
-YOLO = "--yolo" in sys.argv
-APPROVE_LEVEL = "low"
+
+
+def _normalize_approval(arg):
+    """Resolve approval setting aliases.
+
+    Returns (kind, value):
+      ("level", "low"|"medium"|"high") for auto-approval thresholds
+      ("prompt_all", None) for strict approval of every classified action
+      ("yolo", None) for never-prompt mode
+      (None, None) when unrecognized
+    """
+    raw = arg.lower().strip()
+    if raw in ("all", "prompt", "prompt-all", "strict", "none"):
+        return "prompt_all", None
+    if raw == "yolo":
+        return "yolo", None
+    lvl = _normalize_level(raw)
+    if lvl:
+        return "level", lvl
+    return None, None
+
+
+def _approval_display():
+    if YOLO:
+        return "off (yolo)"
+    if APPROVE_LEVEL is None:
+        return "all"
+    return APPROVE_LEVEL
+
+
+def _apply_approval(kind, level=None, *, update_default=True):
+    global YOLO, APPROVE_LEVEL, DEFAULT_APPROVE_LEVEL
+    if kind == "yolo":
+        YOLO = True
+        APPROVE_LEVEL = None
+        if update_default:
+            DEFAULT_APPROVE_LEVEL = None
+    elif kind == "prompt_all":
+        YOLO = False
+        APPROVE_LEVEL = None
+        if update_default:
+            DEFAULT_APPROVE_LEVEL = None
+    elif kind == "level":
+        YOLO = False
+        APPROVE_LEVEL = level
+        if update_default:
+            DEFAULT_APPROVE_LEVEL = level
+    else:
+        return False
+    return True
+
+
+# Approval default resolution (highest precedence wins):
+#   1. --yolo / --approval CLI flags  (explicit, per-invocation)
+#   2. MINION_APPROVAL env var         (persistent, per-user — set in ~/.env)
+#   3. prompt-all built-in default     (safest: prompts on every action)
+#
+# This lets each developer keep their own comfort level in ~/.env (e.g.
+# MINION_APPROVAL=medium) without typing --approval every time, while the
+# repo ships with the safest default (prompt everything) so anyone
+# cloning it starts in cautious mode and can raise it with /approval or the
+# env var. Accepts all|low|medium|high|yolo.
+YOLO = False
+APPROVE_LEVEL = None
+DEFAULT_APPROVE_LEVEL = None
+_env_approval = os.environ.get("MINION_APPROVAL", "").strip().lower()
+if _env_approval:
+    _kind, _lvl = _normalize_approval(_env_approval)
+    if not _apply_approval(_kind, _lvl):
+        print(f"  ✗ unknown MINION_APPROVAL={_env_approval!r} "
+              f"(want all|low|medium|high|yolo); prompting for all actions")
 for _i, _arg in enumerate(sys.argv):
     if _arg == "--approval" and _i + 1 < len(sys.argv):
-        _lvl = _normalize_level(sys.argv[_i + 1])
-        if _lvl:
-            APPROVE_LEVEL = _lvl
-        else:
-            print(f"  ✗ unknown --approval level {sys.argv[_i + 1]!r} (want low|medium|high); using default 'low'")
-if YOLO:
-    APPROVE_LEVEL = None  # yolo overrides --approval; never prompt
+        _kind, _lvl = _normalize_approval(sys.argv[_i + 1])
+        if not _apply_approval(_kind, _lvl):
+            print(f"  ✗ unknown --approval level {sys.argv[_i + 1]!r} "
+                  f"(want all|low|medium|high|yolo); keeping {_approval_display()}")
+if "--yolo" in sys.argv:
+    YOLO = True
+    APPROVE_LEVEL = None  # --yolo overrides everything; never prompt
 
 # --- base-level traffic log -------------------------------------------------
 # Append-only JSONL record of every byte we ship to / receive from the server.
@@ -767,6 +839,23 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
 ]
 
+FINAL_ANSWER_TOOL = {"type": "function", "function": {
+    "name": "final_answer",
+    "description": "Return the visible final answer to the user. Use this when no more tool calls are needed.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "description": "The concise answer to show to the user."},
+            "status": {"type": "string", "enum": ["answered", "blocked"]},
+        },
+        "required": ["answer"],
+    },
+}}
+FINAL_ANSWER_TOOL_CHOICE = {
+    "type": "function",
+    "function": {"name": "final_answer"},
+}
+
 SYSTEM = """You are a terminal coding agent working in the user's current directory.
 Use the provided tools to inspect and modify code. Take one concrete step at a time.
 
@@ -808,6 +897,10 @@ REASONING_LOOP_SIGNALS = (
     "start with the code",
 )
 REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
+REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 12000)
+MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 8192)
+RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
+RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
 # defined just above. See the comment at _DESC_REFRESH_DEFAULT for behavior.
 SESSION_DESC_REFRESH = _env_int("MINION_SESSION_DESC_REFRESH", _DESC_REFRESH_DEFAULT)
@@ -830,9 +923,11 @@ REASONING_LOOP_NUDGES = (
     "emit exactly one <tool_call>{...}</tool_call> block and nothing else. For code "
     "edits, read the target file first unless you already know the exact replacement.",
 )
-REASONING_LOOP_NUDGE = REASONING_LOOP_NUDGES[0]
 REASONING_LOOP_RETRY_LIMIT = _env_int(
     "MINION_REASONING_LOOP_RETRIES", len(REASONING_LOOP_NUDGES))
+REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
+MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
+FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 1024)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 
 
@@ -851,8 +946,9 @@ def _nudge_current_user_turn(messages, nudge):
 # One cheap non-streaming call per write/bash action. Same model, tiny prompt,
 # expects {"level": "low|medium|high", "reason": "<short>"}. Defensive parse —
 # if the model rambles or returns garbage we fall back to "high" so we err on
-# the side of asking. Skipped entirely in YOLO mode (no point paying for a
-# call we won't act on) and for read-only tools (already implicitly safe).
+# the side of asking. Connection failures get a few short retries first because
+# Minion normally talks to reliable or local endpoints. Skipped entirely in YOLO
+# mode (no point paying for a call we won't act on) and for read-only tools.
 
 RISK_SYSTEM = (
     "You are a risk classifier for a coding agent's tool calls. "
@@ -873,14 +969,24 @@ def _assess_risk(action):
     """Return (level, reason). level is one of LEVEL_ORDER; reason is a short
     string. On any failure (server down, bad JSON, unknown level) returns
     ("high", "<error>") so the caller falls through to the prompt path."""
+    payload = [
+        {"role": "system", "content": RISK_SYSTEM},
+        {"role": "user", "content": action},
+    ]
+    attempts = max(0, RISK_CONNECTION_RETRIES) + 1
     try:
-        payload = [
-            {"role": "system", "content": RISK_SYSTEM},
-            {"role": "user", "content": action},
-        ]
-        _log_event("req", {"model": MODEL, "messages": payload, "stream": False, "_purpose": "risk"})
-        resp = client.chat.completions.create(
-            model=MODEL, messages=payload, stream=False, timeout=15)
+        for attempt in range(attempts):
+            try:
+                _log_event("req", {"model": MODEL, "messages": payload,
+                                   "stream": False, "_purpose": "risk",
+                                   "_attempt": attempt + 1})
+                resp = client.chat.completions.create(
+                    model=MODEL, messages=payload, stream=False, timeout=15)
+                break
+            except APIConnectionError:
+                if attempt >= attempts - 1:
+                    return ("high", f"server unreachable after {attempts} attempts; defaulting to high")
+                time.sleep(max(0, RISK_CONNECTION_RETRY_SECONDS))
         try:
             _log_event("resp", {"_purpose": "risk", "data": resp.model_dump()})
         except Exception:
@@ -900,8 +1006,6 @@ def _assess_risk(action):
         if level not in LEVEL_ORDER:
             return ("high", f"unparseable risk response: {text[:80]!r}")
         return (level, reason or level)
-    except APIConnectionError:
-        return ("high", "server unreachable; defaulting to high")
     except Exception as e:
         return ("high", f"risk call failed: {type(e).__name__}")
 
@@ -986,7 +1090,7 @@ def _confirm(action):
     Flow:
       1. YOLO → True (no call, no prompt).
       2. Ask the model for a risk level (skipped in step 1).
-      3. If level ≤ APPROVE_LEVEL → auto-allow (printed as a one-liner).
+      3. If APPROVE_LEVEL is set and level ≤ APPROVE_LEVEL → auto-allow.
       4. Otherwise prompt (Y/n/esc), showing the level + reason so the user
          has context.
 
@@ -996,23 +1100,30 @@ def _confirm(action):
     """
     if YOLO:
         return True
-    # If a tool spinner is running, pause it around our own I/O so the
-    # auto-allow line / Y/n prompt aren't immediately overwritten by the
-    # next animation tick. (The spinner redraws ~11×/s — without this the
-    # prompt would flicker badly or get erased.)
+    # If a tool spinner is running, keep it alive during the risk-classifier
+    # request and pause it only around our own terminal I/O. Otherwise a slow
+    # classifier call looks exactly like a frozen tool.
     sp = _ACTIVE_SPINNER
-    if sp is not None:
-        sp.stop()
+    paused = False
+
+    def pause_spinner():
+        nonlocal paused
+        if sp is not None and not paused:
+            sp.stop()
+            paused = True
+
     try:
         level, reason = _assess_risk(action)
         # APPROVE_LEVEL is the max level to AUTO-APPROVE. level ≤ threshold → run.
         if APPROVE_LEVEL is not None and LEVEL_ORDER[level] <= LEVEL_ORDER[APPROVE_LEVEL]:
             # Auto-allow. Show the assessment so the user has a paper trail.
             short = reason if len(reason) <= 80 else reason[:77] + "..."
+            pause_spinner()
             print(f"{DIM}  ↳ auto-allow [{level}] {action}  ({short}){RESET}")
             return True
         short = reason if len(reason) <= 80 else reason[:77] + "..."
         lvl_color = {"low": DIM, "medium": YELLOW, "high": RED}[level]
+        pause_spinner()
         choice = _ask_approval(
             f"{YELLOW}  allow {action}? {lvl_color}[risk: {level.upper()} — {short}]{RESET} "
             f"{YELLOW}[Y/n/esc] {RESET}")
@@ -1020,7 +1131,7 @@ def _confirm(action):
             raise _EscToChat(action)
         return choice != "n"
     finally:
-        if sp is not None:
+        if sp is not None and paused:
             sp.start()
 
 
@@ -1057,7 +1168,7 @@ def run_tool(name, args):
     # big payload takes a beat — and without this the user just sees a frozen
     # screen after the green model output finishes. _confirm pauses/resumes
     # us around its own I/O so the auto-allow line / Y/n prompt aren't clobbered.
-    spinner = LifeSpinner(label="running")
+    spinner = LifeSpinner(label=f"running {name}")
     spinner.start()
     global _ACTIVE_SPINNER
     _ACTIVE_SPINNER = spinner
@@ -1081,25 +1192,34 @@ def run_tool(name, args):
     return result
 
 
-def open_stream(messages):
+def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None):
     """Open a streaming completion. Retries without tools= if the server rejects
     that param; returns None (after a friendly message) on connection/API failure."""
     try:
+        token_limit = MAX_COMPLETION_TOKENS if max_tokens is None else max_tokens
+        request_opts = {}
+        if token_limit > 0:
+            request_opts["max_tokens"] = token_limit
+        if tool_choice is not None:
+            request_opts["tool_choice"] = tool_choice
         try:
-            _log_event("req", {"model": MODEL, "messages": messages, "tools": TOOLS, "stream": True})
+            _log_event("req", {"model": MODEL, "messages": messages, "tools": tools, "stream": True, **request_opts})
             stream = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS, stream=True,
-                stream_options={"include_usage": True})
+                model=MODEL, messages=messages, tools=tools, stream=True,
+                stream_options={"include_usage": True}, **request_opts)
         except APIConnectionError:
             raise  # server unreachable — don't bother retrying without tools
+        except httpx.HTTPError:
+            raise  # transport failure — retrying without tools won't help
         except Exception:  # reachable but rejected tools= → text-protocol fallback
-            _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": "no-tools"})
+            fallback_opts = {k: v for k, v in request_opts.items() if k != "tool_choice"}
+            _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": "no-tools", **fallback_opts})
             stream = client.chat.completions.create(
                 model=MODEL, messages=messages, stream=True,
-                stream_options={"include_usage": True})
+                stream_options={"include_usage": True}, **fallback_opts)
         # Wrap the stream so every chunk is captured to the log on its way out.
         return _LoggingStream(stream, _llog)
-    except APIConnectionError:
+    except (APIConnectionError, httpx.HTTPError):
         print(f"{RED}  ✗ can't reach {client.base_url} — is the server up? "
               f"Set MINION_BASE_URL (and MINION_MODEL) to point at it.{RESET}")
     except Exception as e:
@@ -1276,14 +1396,27 @@ class _ReasoningLoopSignalCounter:
         return self.hits
 
 
+def _tool_call_progress(tcs):
+    parts = []
+    for i in sorted(tcs):
+        c = tcs[i]
+        name = c["name"] or "tool"
+        args_n = len(c["args"])
+        parts.append(f"{name} args {_abbr(args_n)} chars" if args_n else f"{name} ...")
+    return ", ".join(parts) if parts else "tool call ..."
+
+
 TURN_DONE = "done"
 TURN_TOOL = "tool"
 TURN_LOOP_CUT = "loop_cut"
+TURN_STREAM_CUT = "stream_cut"
+TURN_FORCE_FINAL = "force_final"
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
 
 # --- one model turn (streamed), returns TURN_* status -----------------------
-def model_turn(messages, reasoning_loop_cut_count=0):
+def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
+               forced_final=False):
     # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
     # watcher-setup window (which can be tens of ms on a warm local server but
     # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
@@ -1294,10 +1427,22 @@ def model_turn(messages, reasoning_loop_cut_count=0):
     # processing and the first token may be sitting in the buffer by the time
     # we start the clock, making TTFT look implausibly tiny.
     t0 = time.time()
-    spinner = LifeSpinner(label="thinking · esc to interrupt")
+    spinner_label = (
+        "forcing final answer · esc to interrupt"
+        if forced_final else "thinking · esc to interrupt"
+    )
+    spinner = LifeSpinner(label=spinner_label)
     spinner.start()
     try:
-        stream = open_stream(messages)
+        if forced_final:
+            stream = open_stream(
+                messages,
+                tools=[FINAL_ANSWER_TOOL],
+                tool_choice=FINAL_ANSWER_TOOL_CHOICE,
+                max_tokens=FORCED_FINAL_MAX_TOKENS,
+            )
+        else:
+            stream = open_stream(messages)
     except Exception:
         spinner.stop()
         raise
@@ -1320,7 +1465,31 @@ def model_turn(messages, reasoning_loop_cut_count=0):
     t_first = None   # time of first output token (for TTFT)
     loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
     loop_cut = False
+    loop_cut_reason = "signals"
+    reasoning_only_chars = 0
+    stream_error = None
     interrupted = False
+    tool_status_active = False
+    last_tool_status = 0.0
+
+    def show_tool_status(force=False):
+        nonlocal tool_status_active, last_tool_status
+        now = time.time()
+        if not force and tool_status_active and now - last_tool_status < 0.2:
+            return
+        sys.stdout.write(CLEAR_LINE + f"{CYAN}  ↳ generating tool call{RESET} "
+                         f"{DIM}{_tool_call_progress(tcs)}{RESET}")
+        sys.stdout.flush()
+        tool_status_active = True
+        last_tool_status = now
+
+    def clear_tool_status():
+        nonlocal tool_status_active
+        if tool_status_active:
+            sys.stdout.write(CLEAR_LINE)
+            sys.stdout.flush()
+            tool_status_active = False
+
     try:
         for chunk in stream:
             if _USER_INTERRUPTED.is_set():
@@ -1372,6 +1541,8 @@ def model_turn(messages, reasoning_loop_cut_count=0):
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
                 print(f"{DIM}{rc}{RESET}", end="", flush=True)
+                if not content and not tcs:
+                    reasoning_only_chars += len(rc)
                 if REASONING_LOOP_SIGNAL_LIMIT > 0 and not content and not tcs:
                     prev_hits = loop_signals.hits
                     hits = loop_signals.feed(rc)
@@ -1407,11 +1578,25 @@ def model_turn(messages, reasoning_loop_cut_count=0):
                         print(f"{DIM}  ── reasoning ──{RESET}")
                     if hits >= REASONING_LOOP_SIGNAL_LIMIT:
                         loop_cut = True
+                        loop_cut_reason = "signals"
                         close = getattr(stream, "close", None)
                         if close:
                             close()
                         break
+                if (REASONING_ONLY_CHAR_LIMIT > 0 and not content and not tcs
+                        and reasoning_only_chars >= REASONING_ONLY_CHAR_LIMIT):
+                    print()
+                    print(f"{RED}  ⚠ REASONING-ONLY LIMIT HIT — "
+                          f"{_abbr(reasoning_only_chars)} reasoning chars with no "
+                          f"answer/tool call — cutting stream now{RESET}")
+                    loop_cut = True
+                    loop_cut_reason = "reasoning_only"
+                    close = getattr(stream, "close", None)
+                    if close:
+                        close()
+                    break
             if d.content:
+                clear_tool_status()
                 if mode == "think":
                     # close out the reasoning block; newline guarantees the green
                     # answer starts on a fresh line below the dim text
@@ -1428,6 +1613,9 @@ def model_turn(messages, reasoning_loop_cut_count=0):
                     print()
                     print(f"{DIM}  ──────────────{RESET}")
                     mode = None
+                elif mode == "say":
+                    print(RESET)
+                    mode = None
                 s = tcs.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                 if tc.id:
                     s["id"] = tc.id
@@ -1435,12 +1623,47 @@ def model_turn(messages, reasoning_loop_cut_count=0):
                     s["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     s["args"] += tc.function.arguments
+                show_tool_status()
+    except (APIError, APIConnectionError, httpx.HTTPError) as e:
+        stream_error = e
+        close = getattr(stream, "close", None)
+        if close:
+            try:
+                close()
+            except Exception:
+                pass
     finally:
         spinner.stop()
+        clear_tool_status()
         # signal the watcher to exit (it'll restore termios in its own finally)
         _INTERRUPT_EVENT.set()
         watcher.join(timeout=0.5)
         _INTERRUPT_EVENT.clear()
+    if stream_error is not None:
+        if mode in ("think", "say"):
+            print()
+        if mode == "think":
+            print(f"{DIM}  ──────────────{RESET}")
+        print(RESET)
+        if isinstance(stream_error, httpx.TimeoutException):
+            print(f"{YELLOW}  ✂ STREAM TIMEOUT — server stopped delivering chunks; "
+                  f"discarded partial output and returned to chat input{RESET}")
+            print(f"{DIM}    {type(stream_error).__name__}: {stream_error}{RESET}")
+            return TURN_DONE
+        retry_limit = max(0, MALFORMED_STREAM_RETRY_LIMIT)
+        if malformed_stream_cut_count >= retry_limit:
+            print(f"{RED}  ✗ malformed stream from model/API after "
+                  f"{malformed_stream_cut_count} recoveries — waiting for user input{RESET}")
+            print(f"{DIM}    {type(stream_error).__name__}: {stream_error}{RESET}")
+            return TURN_DONE
+        print(f"{YELLOW}  ✂ MALFORMED STREAM — discarded partial output/tool args; "
+              f"retrying cleanly ({malformed_stream_cut_count + 1}/{retry_limit}){RESET}")
+        _nudge_current_user_turn(
+            messages,
+            "Your previous streamed response became malformed before it completed. "
+            "Discard it. Retry the same task from the current conversation state, "
+            "but emit either valid tool calls or a concise final answer only.")
+        return TURN_STREAM_CUT
     # reasoning-only turn (no content, no tool_calls) — close out the block so
     # the stats footer doesn't run straight into the dim reasoning text
     if mode == "think":
@@ -1463,20 +1686,52 @@ def model_turn(messages, reasoning_loop_cut_count=0):
         return TURN_DONE
 
     if loop_cut:
-        retry_limit = max(0, REASONING_LOOP_RETRY_LIMIT)
-        if reasoning_loop_cut_count >= retry_limit:
-            print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
-                  f"{reasoning_loop_cut_count} cut{'s' if reasoning_loop_cut_count != 1 else ''} "
-                  f"× {loop_signals.hits} ready-to-act signals each; "
-                  f"waiting for user input{RESET}")
+        retry_limit = max(0, (
+            REASONING_ONLY_RETRY_LIMIT
+            if loop_cut_reason == "reasoning_only"
+            else REASONING_LOOP_RETRY_LIMIT
+        ))
+        loop_detail = (
+            f"{loop_signals.hits} ready-to-act signals"
+            if loop_cut_reason == "signals"
+            else f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls"
+        )
+        if forced_final:
+            print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — got {loop_detail}; "
+                  f"returning to chat input{RESET}")
             return TURN_DONE
-        nudge = REASONING_LOOP_NUDGES[
-            min(reasoning_loop_cut_count, len(REASONING_LOOP_NUDGES) - 1)]
-        print(f"{YELLOW}  ✂ REASONING LOOP CUT — {loop_signals.hits} ready-to-act signals "
-              f"(limit {REASONING_LOOP_SIGNAL_LIMIT}); nudging implementation "
-              f"(retry {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
-        _nudge_current_user_turn(messages, nudge)
-        return TURN_LOOP_CUT
+        if reasoning_loop_cut_count >= retry_limit:
+            if loop_cut_reason == "reasoning_only":
+                print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
+                      f"{reasoning_loop_cut_count} forced final "
+                      f"attempt{'s' if reasoning_loop_cut_count != 1 else ''} "
+                      f"× {loop_detail}; waiting for user input{RESET}")
+            else:
+                print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
+                      f"{reasoning_loop_cut_count} cut{'s' if reasoning_loop_cut_count != 1 else ''} "
+                      f"× {loop_detail}; "
+                      f"waiting for user input{RESET}")
+            return TURN_DONE
+        if loop_cut_reason == "signals":
+            nudge = REASONING_LOOP_NUDGES[
+                min(reasoning_loop_cut_count, len(REASONING_LOOP_NUDGES) - 1)]
+            cut_msg = (f"{loop_signals.hits} ready-to-act signals "
+                       f"(limit {REASONING_LOOP_SIGNAL_LIMIT})")
+            print(f"{YELLOW}  ✂ REASONING LOOP CUT — {cut_msg}; nudging implementation "
+                  f"(retry {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
+            _nudge_current_user_turn(messages, nudge)
+            return TURN_LOOP_CUT
+        else:
+            cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
+                       f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
+            print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
+                  f"(attempt {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
+            _nudge_current_user_turn(
+                messages,
+                "Your previous streamed response produced reasoning only. Do not continue "
+                "private reasoning. You must now return a visible final answer. If you are "
+                "blocked, say exactly what is blocking you and what input is needed.")
+            return TURN_FORCE_FINAL
 
     # stats footer — prefer llama.cpp timings if present; otherwise fall back
     # to the standard streaming `usage` object (OpenAI, Z.ai, etc.); otherwise
@@ -1515,6 +1770,29 @@ def model_turn(messages, reasoning_loop_cut_count=0):
         print(f"{DIM}  └ {' · '.join(parts)}{RESET}")
     elif text or tcs:
         print(f"{DIM}  └ {elapsed:4.1f}s wall{RESET}")
+
+    if forced_final and tcs:
+        ordered = [tcs[i] for i in sorted(tcs)]
+        for c in ordered:
+            if c["name"] != "final_answer":
+                continue
+            try:
+                args = json.loads(c["args"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            answer = str(args.get("answer") or "").strip()
+            status = str(args.get("status") or "answered").strip()
+            if answer:
+                print(f"{GREEN}{answer}{RESET}")
+                messages.append({"role": "assistant", "content": answer})
+                return TURN_DONE
+            print(f"{RED}  ✂ FORCED FINAL ANSWER EMPTY — status={status or 'unknown'}; "
+                  f"returning to chat input{RESET}")
+            return TURN_DONE
+        names = ", ".join(c["name"] or "tool" for c in ordered)
+        print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — model emitted {names}; "
+              f"returning to chat input{RESET}")
+        return TURN_DONE
 
     if tcs:  # native tool-calling path
         ordered = [tcs[i] for i in sorted(tcs)]
@@ -1846,16 +2124,15 @@ def read_multiline(initial="", history=None):
 
 # --- repl -------------------------------------------------------------------
 def _banner():
-    """Multi-line banner shown at startup / after a /source switch. Carries
-    the status info (model, source, approval level, endpoint) that used to
-    live in the pinned status bar — now in the banner because a DECSTBM
-    scroll region breaks terminal scrollback."""
+    """Banner shown at startup and after source/approval changes."""
     sep = f"{DIM} · {RESET}"
     parts = [f"{BOLD}minion{RESET}", f"{CYAN}{MODEL}{RESET}"]
     if len(SOURCES) > 1:
         parts.append(f"{MAGENTA}{ACTIVE.name}{RESET}")
-    if YOLO or APPROVE_LEVEL is None:
+    if YOLO:
         parts.append(f"{GREEN}yolo{RESET}")
+    elif APPROVE_LEVEL is None:
+        parts.append(f"{YELLOW}prompt:all{RESET}")
     elif APPROVE_LEVEL == "high":
         parts.append(f"{GREEN}auto:high{RESET}")
     elif APPROVE_LEVEL == "medium":
@@ -1866,27 +2143,14 @@ def _banner():
     return sep.join(parts)
 
 
-def _paint_status_bar():
-    """Reprint the banner (model/source/approval/endpoint) after a /source,
-    /yolo, or /approval switch. Previously repainted a pinned status bar at
-    row 1; now just prints the banner since the scroll-region status bar was
-    removed (it broke terminal scrollback)."""
-    print(_banner())
-
-
 def main():
-    global YOLO, APPROVE_LEVEL
+    global YOLO, APPROVE_LEVEL, DEFAULT_APPROVE_LEVEL
     # `minion sessions [query]` — discover + exit, no REPL. Checked first so
     # it short-circuits before the banner / network source resolution that the
     # interactive loop depends on.
     if _cli_sessions(sys.argv[1:]):
         return
-    # The banner (model, source, approval level, endpoint) is printed at
-    # startup and reprinted on /source, /yolo, /approval switches. Previously
-    # this was a pinned status bar via a DECSTBM scroll region, but that
-    # broke terminal scrollback (lines scrolling off the region top never
-    # entered the scrollback buffer). Now we print normally and scroll
-    # naturally, so all output lands in scrollback as expected.
+    # The banner is printed at startup and after source/approval changes.
     print(_banner())
     print()
     messages = [{"role": "system", "content": SYSTEM}]
@@ -2009,7 +2273,7 @@ def main():
                 switch_source(target)
                 src = SOURCES[target]
                 print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
-                _paint_status_bar()
+                print(_banner())
                 session_dirty = True  # source change is worth persisting
             continue
         if user == "/yolo":
@@ -2017,31 +2281,29 @@ def main():
             if YOLO:
                 APPROVE_LEVEL = None  # never prompt
             else:
-                APPROVE_LEVEL = "low"  # back to default
-            print(f"{DIM}  yolo={YOLO}  approval={('off' if YOLO else APPROVE_LEVEL)}{RESET}")
-            _paint_status_bar()
+                APPROVE_LEVEL = DEFAULT_APPROVE_LEVEL
+            print(f"{DIM}  yolo={YOLO}  approval={_approval_display()}{RESET}")
+            print(_banner())
             continue
         if user.startswith("/approval"):
             parts = user.split()
             if len(parts) == 1:
                 # /approval with no arg → show current setting
-                cur = "off (yolo)" if YOLO else (APPROVE_LEVEL or "off")
-                print(f"{DIM}  approval={cur}  (low|medium|high|yolo){RESET}")
+                print(f"{DIM}  approval={_approval_display()}  (all|low|medium|high|yolo){RESET}")
                 continue
             arg = parts[1]
-            resolved = _normalize_level(arg)
-            if resolved:
-                YOLO = False
-                APPROVE_LEVEL = resolved
-                print(f"{DIM}  approval={resolved} (auto-allow ≤ {resolved}){RESET}")
-                _paint_status_bar()
-            elif arg.lower() == "yolo":
-                YOLO = True
-                APPROVE_LEVEL = None
-                print(f"{DIM}  approval=off (yolo — never prompt){RESET}")
-                _paint_status_bar()
+            kind, resolved = _normalize_approval(arg)
+            if kind:
+                _apply_approval(kind, resolved, update_default=(kind != "yolo"))
+                if kind == "prompt_all":
+                    print(f"{DIM}  approval=all (prompt every classified action){RESET}")
+                elif kind == "level":
+                    print(f"{DIM}  approval={resolved} (auto-allow ≤ {resolved}){RESET}")
+                else:
+                    print(f"{DIM}  approval=off (yolo — never prompt){RESET}")
+                print(_banner())
             else:
-                print(f"{YELLOW}  unknown level {arg!r} — want low|medium|high|yolo{RESET}")
+                print(f"{YELLOW}  unknown level {arg!r} — want all|low|medium|high|yolo{RESET}")
             continue
         if user == "/reset":
             messages = [{"role": "system", "content": SYSTEM}]
@@ -2108,8 +2370,12 @@ def main():
         messages.append({"role": "user", "content": user})
         steps = 0
         reasoning_loop_cuts = 0
+        malformed_stream_cuts = 0
+        force_final = False
         while steps < 25:  # cap runaway tool/retry loops
-            status = model_turn(messages, reasoning_loop_cuts)
+            status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
+                                forced_final=force_final)
+            force_final = False
             if status == TURN_DONE:
                 break
             if status == TURN_ESC:
@@ -2118,8 +2384,16 @@ def main():
             if status == TURN_LOOP_CUT:
                 reasoning_loop_cuts += 1
                 continue
+            if status == TURN_STREAM_CUT:
+                malformed_stream_cuts += 1
+                continue
+            if status == TURN_FORCE_FINAL:
+                reasoning_loop_cuts += 1
+                force_final = True
+                continue
             if status == TURN_TOOL:
                 reasoning_loop_cuts = 0
+                malformed_stream_cuts = 0
                 continue
         # Auto-save after the turn settles (whether it ended cleanly, hit the
         # step cap, or was escaped). This is the Hermes pattern: persist every

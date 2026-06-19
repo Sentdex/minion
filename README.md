@@ -83,10 +83,30 @@ across switches (use `/reset` if you want a clean slate).
 | flag                          | what it does                                              |
 | ----------------------------- | -------------------------------------------------------- |
 | `--yolo`                      | start in never-prompt mode (auto-approve everything)      |
-| `--approval <low\|medium\|high>` | start with a non-default approval threshold            |
+| `--approval <all\|low\|medium\|high\|yolo>` | start with a non-default approval mode       |
 | `--source <name>`             | start on a specific source                                |
 | `--resume [target]`           | resume a saved session; bare = most recent                |
 | `--session <id>`              | start a fresh run attached to a specific session id       |
+
+### Environment variables
+
+minion auto-loads `~/.env` at startup (override with `MINION_ENV_FILE`),
+so per-user settings live in one place instead of being exported every shell.
+
+| env var | what it does |
+| --- | --- |
+| `MINION_APPROVAL` | persistent default approval mode: `all`/`low`/`medium`/`high`/`yolo` (see below). CLI flags `--approval` / `--yolo` override it for a single run. |
+| `MINION_BASE_URL` / `MINION_MODEL` / `MINION_API_KEY` | legacy single-source config (or the `local` fallback) |
+| `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
+| `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
+| `MINION_REASONING_LOOP_SIGNALS` | threshold for the reasoning-loop guard (default 10; `0` disables) |
+| `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 12000; `0` disables) |
+| `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
+| `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 1024) |
+| `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 8192; `0` omits the cap) |
+| `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
+| `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
+| `MINION_SESSION_DESC_REFRESH` | refresh the model-generated session description every N turns (default 6; `0` disables) |
 
 ## Subcommands
 
@@ -101,7 +121,7 @@ across switches (use `/reset` if you want a clean slate).
 | ------------------- | ------------------------------------------------------ |
 | `/source [name]`    | list sources or switch to one (context preserved)       |
 | `/yolo`             | toggle auto-approve for writes and bash                 |
-| `/approval [level]` | show or set risk threshold (`low`/`medium`/`high`/`yolo`) |
+| `/approval [level]` | show or set risk threshold (`all`/`low`/`medium`/`high`/`yolo`) |
 | `/sessions [n]`     | list recent sessions, or show one in full               |
 | `/resume [target]`  | resume a past session (`n`/id/prefix/title)             |
 | `/save [title]`     | save the current session (optional custom title)        |
@@ -137,15 +157,16 @@ a hard stop.
 Every write / edit / bash call is risk-classified by a single cheap model call
 before it runs. Levels: `low` (read-only or trivially reversible), `medium`
 (modifies state but contained/reversible), `high` (destructive, hard to
-reverse, or broad scope). The threshold is the minimum level that requires
-approval:
+reverse, or broad scope). The approval mode controls the maximum risk level
+Minion may auto-allow:
 
-| flag                    | prompts at          | auto-allows       |
+| setting                 | prompts at          | auto-allows       |
 | ----------------------- | ------------------- | ----------------- |
-| _(default — low)_       | low + medium + high | —                 |
-| `--approval medium`     | medium + high       | low               |
-| `--approval high`       | high only           | low + medium      |
-| `--yolo`                | _(never)_           | everything        |
+| _(default)_ / `all`     | low + medium + high | —                 |
+| `--approval low`        | medium + high       | low               |
+| `--approval medium`     | high                | low + medium      |
+| `--approval high`       | —                   | low + medium + high |
+| `--yolo` / `yolo`       | —                   | everything; skips classifier |
 
 The risk assessment is shown in brackets next to the prompt, so you have
 context for the decision:
