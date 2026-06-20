@@ -8,7 +8,7 @@ OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang server, or a
 remote API like Z.ai or OpenAI itself — and start chatting with an agent that
 can read, write, edit, and run shell commands in your project.
 
-The whole thing is one file (`minion.py`, ~2200 lines). No TUI framework, no
+The whole thing is one file (`minion.py`, ~3150 lines). No TUI framework, no
 plugin system, no config file format. It reads from environment variables (and
 `~/.env`), talks directly to the OpenAI SDK, and uses raw terminal escapes for
 its interface. If you want to understand or modify how it works, you read one
@@ -100,12 +100,14 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
 | `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
 | `MINION_REASONING_LOOP_SIGNALS` | threshold for the reasoning-loop guard (default 10; `0` disables) |
+| `MINION_REASONING_LOOP_RETRIES` | max escalating nudges before the reasoning-loop guard gives up and waits for user input (default 3; one per nudge in `REASONING_LOOP_NUDGES`) |
+| `MINION_MALFORMED_STREAM_RETRIES` | max clean retries for malformed/truncated tool-call args or SSE streams before waiting for user input (default 2) |
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 12000; `0` disables) |
 | `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
 | `MINION_REASONING_GIBBERISH_CHARS` | rolling reasoning window for numeric/markup noise detection (default 600; `0` disables) |
-| `MINION_REASONING_GIBBERISH_RETRIES` | recovery attempts after reasoning noise is detected (default 1) |
+| `MINION_REASONING_GIBBERISH_RETRIES` | low-temp recovery attempts after reasoning noise is detected before forcing a visible checkpoint (default 1) |
 | `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | sampler params used only for malformed/gibberish recovery retries (defaults `0.2` / `0.95`; negative values omit them) |
-| `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 1024) |
+| `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 2048) |
 | `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 8192; `0` omits the cap) |
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
 | `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
@@ -132,6 +134,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `/delete [target]`  | delete a saved session                                  |
 | `/compress`         | summarize older turns into one, keep last 2 verbatim     |
 | `/compact`          | alias for `/compress`                                    |
+| `/recover [note]`   | force a low-temp visible checkpoint after a bad stream   |
 | `/reset`            | clear conversation, start a fresh session               |
 | `/quit`             | exit                                                     |
 
@@ -266,8 +269,15 @@ minion also watches reasoning-only output for dense numeric/markup noise before
 any visible answer or tool call exists. If that trips, the partial assistant turn
 is discarded and the next retry uses recovery sampler params
 (`MINION_RECOVERY_TEMPERATURE=0.2`, `MINION_RECOVERY_TOP_P=0.95` by default).
-Normal turns do not pass sampler params, so llama.cpp or the active API keeps its
-own defaults unless a recovery retry is in progress.
+If the recovery retry also collapses into reasoning noise, minion stops trying to
+continue hidden reasoning and forces a bounded visible checkpoint via the
+`final_answer` tool. Normal turns do not pass sampler params, so llama.cpp or the
+active API keeps its own defaults unless a recovery path is in progress.
+
+You can trigger the same checkpoint path manually with `/recover [optional note]`
+after interrupting a bad stream or once the prompt returns. The command appends a
+manual recovery note to the conversation and immediately forces a low-temperature
+`final_answer` checkpoint instead of letting the model continue free-form.
 
 ## Tools
 

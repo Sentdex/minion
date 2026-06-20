@@ -301,7 +301,7 @@ def test_reasoning_only_stall_requests_forced_final():
                     {"role": "user", "content": "answer me"}]
         status = m.model_turn(messages)
         assert status == m.TURN_FORCE_FINAL, f"expected TURN_FORCE_FINAL, got {status!r}"
-        assert "visible final answer" in messages[-1]["content"]
+        assert "complete visible answer" in messages[-1]["content"]
     finally:
         m.open_stream = saved_open_stream
         m._interrupt_watcher = saved_watcher
@@ -353,6 +353,39 @@ def test_forced_final_tool_call_becomes_assistant_text():
     print("PASS — forced final_answer tool call becomes assistant text")
 
 
+def test_forced_final_length_marks_partial_answer():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    m._interrupt_watcher = lambda: None
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+
+    def fake_open_stream(messages, **kw):
+        return iter([_FakeChunk(_FakeDelta(content="partial final"), finish_reason="length")])
+
+    m.open_stream = fake_open_stream
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages, forced_final=True)
+        assert status == m.TURN_DONE, f"expected TURN_DONE, got {status!r}"
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"].startswith("partial final")
+        assert "Truncated by token limit" in messages[-1]["content"]
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        builtins.print = _REAL_PRINT
+    print("PASS — forced final length stop is marked in history")
+
+
 def test_reasoning_gibberish_detector_is_narrow():
     bad = (
         "8486414041606060102200101010801060divdivdivdiv2005068071510:"
@@ -368,7 +401,15 @@ def test_reasoning_gibberish_detector_is_narrow():
         "/home/h/llama.cpp/build/bin/llama-server --ctx-size 300000 "
         "--parallel 4 --kv-unified --cache-reuse 256 --tensor-split 1,0.75,0.9,1"
     )
+    repeated = (" your you the ` ** your your to so it 0 2 " * 12)
+    layout_loop = (
+        'pane pane // pane pane 01 pane pane name { pane pane '
+        'start "1303" 1011 0 the010777010133311 // // '
+        '--right011 --279302022131 right pane /home name name '
+    ) * 4
     assert m._reasoning_gibberish_reason(bad), "expected numeric/markup sludge to trip"
+    assert m._reasoning_gibberish_reason(repeated), "expected repeated short-token sludge to trip"
+    assert m._reasoning_gibberish_reason(layout_loop), "expected layout-token sludge to trip"
     assert m._reasoning_gibberish_reason(command) is None, "shell command should not trip"
     print("PASS — gibberish detector catches sludge without catching shell commands")
 
@@ -401,7 +442,7 @@ def test_reasoning_gibberish_cut_requests_recovery():
         status = m.model_turn(messages)
         assert status == m.TURN_GIBBERISH_CUT, f"expected gibberish cut, got {status!r}"
         assert messages[-1]["role"] == "user"
-        assert "unreadable numeric/markup noise" in messages[-1]["content"]
+        assert "unreadable token noise" in messages[-1]["content"]
         assert not any(msg.get("role") == "assistant" for msg in messages)
     finally:
         m.open_stream = saved_open_stream
@@ -410,6 +451,85 @@ def test_reasoning_gibberish_cut_requests_recovery():
         m.REASONING_GIBBERISH_CHARS = saved_window
         builtins.print = _REAL_PRINT
     print("PASS — reasoning gibberish cut retries from clean history")
+
+
+def test_repeated_reasoning_gibberish_forces_checkpoint():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    saved_window = m.REASONING_GIBBERISH_CHARS
+    saved_retries = m.REASONING_GIBBERISH_RETRY_LIMIT
+    m._interrupt_watcher = lambda: None
+    m.REASONING_GIBBERISH_CHARS = 240
+    m.REASONING_GIBBERISH_RETRY_LIMIT = 1
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    sludge = (
+        "8486414041606060102200101010801060divdivdivdiv2005068071510:"
+        "0550682710250203905066520.06083573608206 . .22252divdiv"
+        "224577422062783226061090004300355262059204957860900988 "
+        ".4045027211377408858</</526291006612 .0467210 .5879238980"
+        "091428077240031091399928 .10968062577204205324722divdiv"
+    )
+    m.open_stream = lambda messages, **kw: iter([_FakeChunk(_FakeDelta(reasoning=sludge))])
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "continue"}]
+        status = m.model_turn(messages, gibberish_cut_count=1)
+        assert status == m.TURN_FORCE_FINAL, f"expected forced checkpoint, got {status!r}"
+        assert messages[-1]["role"] == "user"
+        assert "bounded visible checkpoint" in messages[-1]["content"]
+        assert not any(msg.get("role") == "assistant" for msg in messages)
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        m.REASONING_GIBBERISH_CHARS = saved_window
+        m.REASONING_GIBBERISH_RETRY_LIMIT = saved_retries
+        builtins.print = _REAL_PRINT
+    print("PASS — repeated reasoning gibberish forces visible checkpoint")
+
+
+def test_reasoning_only_empty_completion_forces_final_without_empty_assistant():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    saved_limit = m.REASONING_ONLY_CHAR_LIMIT
+    saved_retries = m.REASONING_ONLY_RETRY_LIMIT
+    m._interrupt_watcher = lambda: None
+    m.REASONING_ONLY_CHAR_LIMIT = 9999
+    m.REASONING_ONLY_RETRY_LIMIT = 1
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    m.open_stream = lambda messages, **kw: iter([
+        _FakeChunk(_FakeDelta(reasoning="I should answer soon but never emit content."))
+    ])
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages)
+        assert status == m.TURN_FORCE_FINAL, f"expected forced final, got {status!r}"
+        assert messages[-1]["role"] == "user"
+        assert "complete visible answer" in messages[-1]["content"]
+        assert not any(msg.get("role") == "assistant" for msg in messages)
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        m.REASONING_ONLY_CHAR_LIMIT = saved_limit
+        m.REASONING_ONLY_RETRY_LIMIT = saved_retries
+        builtins.print = _REAL_PRINT
+    print("PASS — empty reasoning-only turns force final without empty assistant")
 
 
 def test_repl_uses_recovery_sampling_after_gibberish_cut():
@@ -448,6 +568,82 @@ def test_repl_uses_recovery_sampling_after_gibberish_cut():
     print("PASS — REPL retries gibberish cuts with recovery sampling once")
 
 
+def test_repl_forces_checkpoint_with_recovery_sampling_after_repeated_gibberish():
+    saved_read_multiline = m.read_multiline
+    saved_model_turn = m.model_turn
+    saved_banner = m._banner
+    m._banner = lambda: ""
+    builtins.print = lambda *a, **k: None
+    calls = []
+
+    def fake_model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
+                        gibberish_cut_count=0, forced_final=False,
+                        recovery_sampling=False):
+        calls.append({
+            "gibberish_cut_count": gibberish_cut_count,
+            "forced_final": forced_final,
+            "recovery_sampling": recovery_sampling,
+        })
+        if len(calls) == 1:
+            return m.TURN_GIBBERISH_CUT
+        if len(calls) == 2:
+            return m.TURN_FORCE_FINAL
+        return m.TURN_DONE
+
+    prompts = iter(["hello", "/quit"])
+    m.read_multiline = lambda history=None: next(prompts)
+    m.model_turn = fake_model_turn
+    try:
+        m.main()
+        assert calls == [
+            {"gibberish_cut_count": 0, "forced_final": False, "recovery_sampling": False},
+            {"gibberish_cut_count": 1, "forced_final": False, "recovery_sampling": True},
+            {"gibberish_cut_count": 1, "forced_final": True,  "recovery_sampling": True},
+        ], calls
+    finally:
+        m.read_multiline = saved_read_multiline
+        m.model_turn = saved_model_turn
+        m._banner = saved_banner
+        builtins.print = _REAL_PRINT
+    print("PASS — REPL forces low-temp checkpoint after repeated gibberish")
+
+
+def test_repl_recover_command_forces_visible_checkpoint():
+    saved_read_multiline = m.read_multiline
+    saved_model_turn = m.model_turn
+    saved_banner = m._banner
+    m._banner = lambda: ""
+    builtins.print = lambda *a, **k: None
+    calls = []
+
+    def fake_model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
+                        gibberish_cut_count=0, forced_final=False,
+                        recovery_sampling=False):
+        calls.append({
+            "forced_final": forced_final,
+            "recovery_sampling": recovery_sampling,
+            "last_message": messages[-1]["content"],
+        })
+        return m.TURN_DONE
+
+    prompts = iter(["/recover save the audio diagnosis", "/quit"])
+    m.read_multiline = lambda history=None: next(prompts)
+    m.model_turn = fake_model_turn
+    try:
+        m.main()
+        assert len(calls) == 1, calls
+        assert calls[0]["forced_final"] is True
+        assert calls[0]["recovery_sampling"] is True
+        assert "Manual recovery requested" in calls[0]["last_message"]
+        assert "save the audio diagnosis" in calls[0]["last_message"]
+    finally:
+        m.read_multiline = saved_read_multiline
+        m.model_turn = saved_model_turn
+        m._banner = saved_banner
+        builtins.print = _REAL_PRINT
+    print("PASS — /recover forces a low-temp visible checkpoint")
+
+
 if __name__ == "__main__":
     test_confirm_esc_raises()
     test_confirm_y_n()
@@ -457,7 +653,12 @@ if __name__ == "__main__":
     test_repl_breaks_on_esc()
     test_reasoning_only_stall_requests_forced_final()
     test_forced_final_tool_call_becomes_assistant_text()
+    test_forced_final_length_marks_partial_answer()
     test_reasoning_gibberish_detector_is_narrow()
     test_reasoning_gibberish_cut_requests_recovery()
+    test_repeated_reasoning_gibberish_forces_checkpoint()
+    test_reasoning_only_empty_completion_forces_final_without_empty_assistant()
     test_repl_uses_recovery_sampling_after_gibberish_cut()
+    test_repl_forces_checkpoint_with_recovery_sampling_after_repeated_gibberish()
+    test_repl_recover_command_forces_visible_checkpoint()
     print("\nALL ESC-APPROVAL TESTS PASSED")

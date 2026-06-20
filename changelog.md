@@ -2,6 +2,91 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — `/recover` command (manual recovery checkpoint)
+New in-session command `/recover [optional note]` forces a low-temperature
+visible checkpoint via the `final_answer` tool. After a bad stream —
+truncated output, reasoning spirals, gibberish — type `/recover` (optionally
+with a note) and the model discards any corrupted reasoning and emits a
+bounded visible answer instead of continuing free-form.
+
+- New `MANUAL_RECOVERY_NUDGE` prompt; `/recover` appends it (plus the user
+  note) as a `[Runtime note: …]` user turn and runs
+  `_run_model_turn_loop(messages, force_final=True, recovery_sampling=True)`.
+- The REPL turn loop was extracted into `_run_model_turn_loop(messages,
+  force_final=False, recovery_sampling=False)` so both the main REPL path
+  and `/recover` share one code path (the inline loop in `main` was replaced
+  with a call to the new function).
+- `final_answer` tool description sharpened to ask for a "complete, concise"
+  answer that doesn't trail off, since forced-final answers are the recovery
+  fallback and a truncated-feeling response defeats the point.
+
+### Added — gibberish recovery escalates to a visible checkpoint
+Previously, if the gibberish detector cut the stream and the recovery retry
+also collapsed into noise, minion gave up and waited for user input —
+leaving the user staring at a dead turn with no answer. Now, after
+`MINION_REASONING_GIBBERISH_RETRIES` (default 1) recovery attempts fail,
+minion escalates: it nudges the model with `GIBBERISH_CHECKPOINT_NUDGE`
+(asking for a bounded visible checkpoint: last valid result, next step,
+blockers) and returns `TURN_FORCE_FINAL`, which re-enters the turn with
+`force_final=True` + `recovery_sampling=True` so the model emits a
+`final_answer` tool call at a low temperature instead of more hidden
+reasoning. The turn loop resets all cut counters on a successful tool turn,
+so a clean recovery puts the agent back on track.
+
+### Added — forced-final truncation marker
+When a forced `final_answer` response hits the token limit (`finish_reason`
+contains `"length"`), the partial text is now saved into the message
+history with a `[Truncated by token limit before completion.]` marker and a
+yellow `✂ FORCED FINAL ANSWER HIT TOKEN LIMIT` notice, instead of being
+silently discarded as an empty turn. `FORCED_FINAL_MAX_TOKENS` raised from
+`1024` to `2048` to give the forced-final rescue more room to complete.
+
+### Added — expanded gibberish detector (low-info & layout loops)
+`_reasoning_gibberish_reason` now catches two more failure modes beyond
+dense numeric/markup noise:
+
+- **Repeated short fragments** — high ratio of ≤4-char tokens with very low
+  unique-token diversity and a single dominant token (the "your you the ` **
+  your your to so it" loop).
+- **Low-information repetition** — most tokens are stop-words / single
+  letters / digits, with low unique diversity.
+- **Dominant token loop** — top-5 tokens account for >55% of the stream
+  alongside heavy numeric/symbol content.
+- **Layout-token repetition** — words like `pane`, `split`, `tab`, `layout`,
+  `start`, `name` dominate alongside numeric/symbol noise (the
+  "pane pane // pane pane 01" loop a layout-obsessed model can get stuck in).
+
+Each sub-detector contributes +2 to the score (threshold remains 3), so any
+two firing is enough to trip the cut. The docstring was updated to reflect
+that the detector now targets "low-information scaffolding" in addition to
+numeric/markup noise. Tests expanded with new sludge patterns for both new
+modes.
+
+### Fixed — empty assistant messages pruned before save/stream
+A reasoning-only turn that produced no visible content and no tool calls
+could leave an empty assistant message (`{"role": "assistant", "content": ""}` or
+`null`) in the message array, which some chat templates reject on the next
+request. `_is_empty_assistant_message(msg)` / `_prune_empty_assistant_messages(messages)`
+now strip those turns at three points: before writing a session file, after
+loading a session, and before opening a stream. A reasoning-only stall that
+triggers the forced-final path no longer appends an empty assistant turn
+before returning `TURN_FORCE_FINAL`.
+
+### Changed — reasoning-only stall now also catches the no-signal case
+The `reasoning_only` cut (large reasoning output with zero content/tool calls)
+was previously only reachable via the signal counter path. It's now also set
+when the turn ends with no `loop_cut`, no text, no tool calls, but
+`reasoning_only_chars > 0` — so a model that streams a long reasoning block
+and then stops (without emitting "ready to act" signals) still gets the
+forced-final rescue instead of a silent empty turn.
+
+### Changed — recovery nudges extracted to named constants
+The inline nudge strings for forced-final, gibberish-recovery, gibberish-
+checkpoint, and manual-recovery are now module-level constants
+(`FORCED_FINAL_NUDGE`, `GIBBERISH_RECOVERY_NUDGE`,
+`GIBBERISH_CHECKPOINT_NUDGE`, `MANUAL_RECOVERY_NUDGE`) for readability and
+so the tests can assert against stable wording.
+
 > **Note:** the file was previously called `miniagent.py` and configured via
 > `AGENT_BASE_URL` / `AGENT_MODEL` / `AGENT_API_KEY`. Renamed to `minion` /
 > `MINION_*` for clarity. The old env vars are silently ignored — set the new

@@ -35,7 +35,7 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
 """
@@ -138,6 +138,37 @@ def _safe_title(text, maxlen=60):
     return text or None
 
 
+def _is_empty_assistant_message(msg):
+    if msg.get("role") != "assistant" or msg.get("tool_calls"):
+        return False
+    content = msg.get("content")
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                return False
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return False
+        return True
+    return False
+
+
+def _prune_empty_assistant_messages(messages):
+    """Drop assistant turns that have neither visible content nor tool calls."""
+    if not isinstance(messages, list):
+        return 0
+    kept = [m for m in messages if not _is_empty_assistant_message(m)]
+    removed = len(messages) - len(kept)
+    if removed:
+        messages[:] = kept
+    return removed
+
+
 def _session_path(session_id):
     return os.path.join(_sessions_dir(), f"{session_id}.json")
 
@@ -151,6 +182,7 @@ def _write_session(session_id, messages, meta=None):
     """
     d = _sessions_dir()
     os.makedirs(d, exist_ok=True)
+    _prune_empty_assistant_messages(messages)
     path = _session_path(session_id)
     now = time.time()
     existing = {}
@@ -191,6 +223,7 @@ def _load_session(session_id):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and "messages" in data:
+            _prune_empty_assistant_messages(data.get("messages"))
             return data
     except (OSError, IOError, json.JSONDecodeError):
         pass
@@ -903,11 +936,14 @@ TOOLS = [
 
 FINAL_ANSWER_TOOL = {"type": "function", "function": {
     "name": "final_answer",
-    "description": "Return the visible final answer to the user. Use this when no more tool calls are needed.",
+    "description": "Return a complete, concise visible answer to the user. Use this when no more tool calls are needed.",
     "parameters": {
         "type": "object",
         "properties": {
-            "answer": {"type": "string", "description": "The concise answer to show to the user."},
+            "answer": {
+                "type": "string",
+                "description": "The complete concise answer to show to the user. Keep it short and do not trail off.",
+            },
             "status": {"type": "string", "enum": ["answered", "blocked"]},
         },
         "required": ["answer"],
@@ -1017,8 +1053,36 @@ REASONING_LOOP_RETRY_LIMIT = _env_int(
 REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
 REASONING_GIBBERISH_RETRY_LIMIT = _env_int("MINION_REASONING_GIBBERISH_RETRIES", 1)
 MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
-FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 1024)
+FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
+
+FORCED_FINAL_NUDGE = (
+    "Your previous streamed response produced reasoning only. Do not continue "
+    "private reasoning. Use the final_answer tool if available. Return a complete "
+    "visible answer now in at most six short bullets or paragraphs. If you are "
+    "blocked, say exactly what is blocking you and what input is needed."
+)
+GIBBERISH_RECOVERY_NUDGE = (
+    "Your previous reasoning stream became unreadable token noise. Discard that "
+    "broken reasoning completely. Do not rephrase it or continue from any corrupted "
+    "tokens. Continue from the last valid tool result or visible user instruction "
+    "with exactly one concrete action: a valid tool call or a concise visible answer."
+)
+GIBBERISH_CHECKPOINT_NUDGE = (
+    "Repeated reasoning recovery failed. Do not continue private reasoning and do "
+    "not attempt another tool call except final_answer. Return a bounded visible checkpoint for the "
+    "user with: (1) the last valid result you can rely on, (2) the next concrete "
+    "action you would take, and (3) any blocker or uncertainty. Keep it to at most "
+    "six short bullets or paragraphs."
+)
+MANUAL_RECOVERY_NUDGE = (
+    "Manual recovery requested by the user because the previous response appeared "
+    "off the rails or corrupted. Discard any corrupted reasoning/output and do not "
+    "continue private reasoning. Use the final_answer tool if available. Return a "
+    "bounded visible checkpoint with: (1) the last valid result you can rely on, "
+    "(2) the next concrete action you would take, and (3) any blocker or "
+    "uncertainty. Keep it concise."
+)
 
 
 def _nudge_current_user_turn(messages, nudge):
@@ -1310,6 +1374,7 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
     """Open a streaming completion. Retries without tools= if the server rejects
     that param; returns None (after a friendly message) on connection/API failure."""
     try:
+        _prune_empty_assistant_messages(messages)
         token_limit = MAX_COMPLETION_TOKENS if max_tokens is None else max_tokens
         request_opts = {}
         if token_limit > 0:
@@ -1515,9 +1580,10 @@ class _ReasoningLoopSignalCounter:
 def _reasoning_gibberish_reason(sample):
     """Return a short reason when reasoning text has collapsed into junk.
 
-    This intentionally targets the observed failure mode: dense numeric/markup
-    noise in reasoning_content before the model emits content or a tool call.
-    It is not a general "weird text" filter.
+    This intentionally targets observed failure modes: dense numeric/markup
+    noise, or repetitive low-information scaffolding in reasoning_content
+    before the model emits content or a tool call. It is not a general
+    "weird text" filter.
     """
     sample = sample.strip()
     n = len(sample)
@@ -1554,6 +1620,51 @@ def _reasoning_gibberish_reason(sample):
     if whitespace_ratio < 0.06 and punct_ratio > 0.10 and alpha_ratio < 0.38:
         score += 1
         reasons.append("compact symbol soup")
+
+    tokens = re.findall(r"[A-Za-z']+|\d+|//|[`*_{}\"'-]{1,3}", sample.lower())
+    if len(tokens) >= 40:
+        counts = {}
+        for tok in tokens:
+            counts[tok] = counts.get(tok, 0) + 1
+        ranked = sorted(counts.values(), reverse=True)
+        unique_ratio = len(counts) / len(tokens)
+        top_ratio = max(counts.values()) / len(tokens)
+        top5_ratio = sum(ranked[:5]) / len(tokens)
+        short_ratio = sum(len(tok) <= 4 for tok in tokens) / len(tokens)
+        numeric_token_ratio = sum(tok.isdigit() for tok in tokens) / len(tokens)
+        symbol_token_ratio = sum(
+            bool(re.fullmatch(r"//|[`*_{}\"'-]{1,3}", tok))
+            for tok in tokens
+        ) / len(tokens)
+        low_info = {
+            "`", "``", "```", "*", "**", "***", "_", "__", "___", "//",
+            "a", "i", "it", "me", "my", "so", "the", "to", "you",
+            "your", "you're", "as", "and", "or", "of", "in", "on",
+        }
+        layoutish = {
+            "arg", "args", "bottom", "command", "cwd", "focus", "home",
+            "layout", "left", "name", "pane", "right", "size", "split",
+            "start", "tab", "top",
+        }
+        low_info_ratio = sum(
+            tok in low_info or tok.isdigit()
+            for tok in tokens
+        ) / len(tokens)
+        layoutish_ratio = sum(tok in layoutish for tok in tokens) / len(tokens)
+        if unique_ratio < 0.24 and short_ratio > 0.72 and top_ratio > 0.10:
+            score += 2
+            reasons.append("repeated short fragments")
+        if unique_ratio < 0.36 and low_info_ratio > 0.62:
+            score += 2
+            reasons.append("low-information repetition")
+        if (unique_ratio < 0.34 and top5_ratio > 0.55
+                and numeric_token_ratio + symbol_token_ratio > 0.28):
+            score += 2
+            reasons.append("dominant token loop")
+        if (layoutish_ratio > 0.28 and top5_ratio > 0.48
+                and numeric_token_ratio + symbol_token_ratio > 0.22):
+            score += 2
+            reasons.append("layout-token repetition")
 
     if score >= 3:
         return ", ".join(reasons[:2]) or "unreadable reasoning"
@@ -1887,6 +1998,10 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             "Acknowledge briefly and wait for their next message.]"})
         return TURN_DONE
 
+    if not loop_cut and not text.strip() and not tcs and reasoning_only_chars > 0:
+        loop_cut = True
+        loop_cut_reason = "reasoning_only"
+
     if loop_cut:
         if loop_cut_reason == "reasoning_only":
             retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
@@ -1912,10 +2027,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                       f"attempt{'s' if cut_count != 1 else ''} "
                       f"× {loop_detail}; waiting for user input{RESET}")
             elif loop_cut_reason == "gibberish":
-                print(f"{RED}  ✂ REASONING GIBBERISH RESCUE FAILED — gave up after "
+                print(f"{YELLOW}  ✂ REASONING GIBBERISH RECOVERY FAILED — "
                       f"{cut_count} recover"
                       f"{'ies' if cut_count != 1 else 'y'} × {loop_detail}; "
-                      f"waiting for user input{RESET}")
+                      f"forcing visible checkpoint{RESET}")
+                _nudge_current_user_turn(messages, GIBBERISH_CHECKPOINT_NUDGE)
+                return TURN_FORCE_FINAL
             else:
                 print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
                       f"{cut_count} cut{'s' if cut_count != 1 else ''} "
@@ -1936,20 +2053,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                        f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
             print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
                   f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
-            _nudge_current_user_turn(
-                messages,
-                "Your previous streamed response produced reasoning only. Do not continue "
-                "private reasoning. You must now return a visible final answer. If you are "
-                "blocked, say exactly what is blocking you and what input is needed.")
+            _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
             return TURN_FORCE_FINAL
         print(f"{YELLOW}  ✂ REASONING GIBBERISH CUT — {loop_detail}; "
               f"retrying with recovery sampling "
               f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
-        _nudge_current_user_turn(
-            messages,
-            "Your previous reasoning stream became unreadable numeric/markup noise. "
-            "Discard it. Continue from the current task with either a valid tool call "
-            "or a concise visible answer.")
+        _nudge_current_user_turn(messages, GIBBERISH_RECOVERY_NUDGE)
         return TURN_GIBBERISH_CUT
 
     # stats footer — prefer llama.cpp timings if present; otherwise fall back
@@ -2092,8 +2201,58 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         messages.append({"role": "user", "content": "\n".join(obs)})
         return TURN_TOOL
 
+    if forced_final and text.strip() and "length" in finish_reasons:
+        print(f"{YELLOW}  ✂ FORCED FINAL ANSWER HIT TOKEN LIMIT — saved partial answer "
+              f"with truncation marker{RESET}")
+        messages.append({
+            "role": "assistant",
+            "content": text.rstrip() + "\n\n[Truncated by token limit before completion.]",
+        })
+        return TURN_DONE
+
+    if not text.strip():
+        return TURN_DONE
     messages.append({"role": "assistant", "content": text})
     return TURN_DONE
+
+
+def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
+    steps = 0
+    reasoning_loop_cuts = 0
+    malformed_stream_cuts = 0
+    gibberish_cuts = 0
+    while steps < 25:  # cap runaway tool/retry loops
+        status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
+                            gibberish_cuts, forced_final=force_final,
+                            recovery_sampling=recovery_sampling)
+        force_final = False
+        recovery_sampling = False
+        if status == TURN_DONE:
+            break
+        if status == TURN_ESC:
+            break  # user pressed Esc at an approval → drop to chat input
+        steps += 1
+        if status == TURN_LOOP_CUT:
+            reasoning_loop_cuts += 1
+            continue
+        if status == TURN_STREAM_CUT:
+            malformed_stream_cuts += 1
+            recovery_sampling = True
+            continue
+        if status == TURN_GIBBERISH_CUT:
+            gibberish_cuts += 1
+            recovery_sampling = True
+            continue
+        if status == TURN_FORCE_FINAL:
+            reasoning_loop_cuts += 1
+            force_final = True
+            recovery_sampling = True
+            continue
+        if status == TURN_TOOL:
+            reasoning_loop_cuts = 0
+            malformed_stream_cuts = 0
+            gibberish_cuts = 0
+            continue
 
 
 # --- multi-line chatbox input ---------------------------------------------
@@ -2557,6 +2716,17 @@ def main():
             session_dirty = False
             print(f"{DIM}  new session {session_id}{RESET}")
             continue
+        if user == "/recover" or user.startswith("/recover "):
+            note = user.split(None, 1)[1].strip() if " " in user else ""
+            content = f"[Runtime note: {MANUAL_RECOVERY_NUDGE}"
+            if note:
+                content += f" User note: {note}"
+            content += "]"
+            messages.append({"role": "user", "content": content})
+            print(f"{YELLOW}  ↳ manual recovery requested — forcing visible checkpoint{RESET}")
+            _run_model_turn_loop(messages, force_final=True, recovery_sampling=True)
+            session_dirty = True
+            continue
         if user in ("/compress", "/compact"):
             # nothing to compress if we're under (system + KEEP) turns
             body_len = len(messages) - (1 if messages and messages[0].get("role") == "system" else 0)
@@ -2611,43 +2781,7 @@ def main():
             history.append(user)
         print()  # breathing room before the spinner/text starts
         messages.append({"role": "user", "content": user})
-        steps = 0
-        reasoning_loop_cuts = 0
-        malformed_stream_cuts = 0
-        gibberish_cuts = 0
-        force_final = False
-        recovery_sampling = False
-        while steps < 25:  # cap runaway tool/retry loops
-            status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
-                                gibberish_cuts, forced_final=force_final,
-                                recovery_sampling=recovery_sampling)
-            force_final = False
-            recovery_sampling = False
-            if status == TURN_DONE:
-                break
-            if status == TURN_ESC:
-                break  # user pressed Esc at an approval → drop to chat input
-            steps += 1
-            if status == TURN_LOOP_CUT:
-                reasoning_loop_cuts += 1
-                continue
-            if status == TURN_STREAM_CUT:
-                malformed_stream_cuts += 1
-                recovery_sampling = True
-                continue
-            if status == TURN_GIBBERISH_CUT:
-                gibberish_cuts += 1
-                recovery_sampling = True
-                continue
-            if status == TURN_FORCE_FINAL:
-                reasoning_loop_cuts += 1
-                force_final = True
-                continue
-            if status == TURN_TOOL:
-                reasoning_loop_cuts = 0
-                malformed_stream_cuts = 0
-                gibberish_cuts = 0
-                continue
+        _run_model_turn_loop(messages)
         # Auto-save after the turn settles (whether it ended cleanly, hit the
         # step cap, or was escaped). This is the Hermes pattern: persist every
         # turn so a crash / accidental close never loses work.

@@ -57,6 +57,25 @@ def test_write_load_roundtrip():
     print("PASS — write → load round-trips messages + meta")
 
 
+def test_write_session_prunes_empty_assistant_messages():
+    sid = "20250101-120000-empty0"
+    messages = [
+        _msg("user", "hello"),
+        _msg("assistant", ""),
+        _msg("assistant", "   "),
+        _msg("assistant", "real reply"),
+    ]
+    m._write_session(sid, messages)
+    loaded = m._load_session(sid)
+    assert loaded is not None
+    assert loaded["messages"] == [
+        _msg("user", "hello"),
+        _msg("assistant", "real reply"),
+    ]
+    assert messages == loaded["messages"]
+    print("PASS — empty assistant messages are pruned before session save")
+
+
 def test_write_is_atomic_and_merges_meta():
     sid = "20250101-120000-def456"
     m._write_session(sid, [_msg("user", "first")], {"source": "local"})
@@ -262,6 +281,7 @@ def test_cli_sessions_list_and_filter():
 
 if __name__ == "__main__":
     test_write_load_roundtrip()
+    test_write_session_prunes_empty_assistant_messages()
     test_write_is_atomic_and_merges_meta()
     test_load_missing_returns_none()
     test_list_sessions_orders_newest_first_with_preview()
