@@ -913,7 +913,9 @@ def run_bash(command, **_):
         return "DENIED by user"
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
     out = (r.stdout or "") + (r.stderr or "")
-    return f"[exit {r.returncode}]\n{out[:8000]}"
+    # Big safety slice to bound memory; _sanitize_tool_result applies the real
+    # per-result context budget (TOOL_RESULT_CHARS) with dedup.
+    return f"[exit {r.returncode}]\n{out[:200000]}"
 
 
 DISPATCH = {
@@ -1019,11 +1021,35 @@ REASONING_LOOP_SIGNALS = (
     "start with the code",
 )
 REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
-REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 12000)
+REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 36000)
 REASONING_GIBBERISH_CHARS = _env_int("MINION_REASONING_GIBBERISH_CHARS", 600)
-MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 8192)
-RECOVERY_TEMPERATURE = _env_float("MINION_RECOVERY_TEMPERATURE", 0.2)
+MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 16000)
+# Cap + dedup tool results before they enter the message history. Large,
+# near-duplicate tool outputs (find/ls/grep path dumps) are the fuel for the
+# context-copying repetition collapse some local models fall into — bounding
+# them is the cheapest prevention. 0 disables the size cap (dedup still runs).
+TOOL_RESULT_CHARS = _env_int("MINION_TOOL_RESULT_CHARS", 20000)
+# Recovery sampler. A gibberish/repetition collapse is a LOW-ENTROPY attractor:
+# the model is copying long n-grams already in context (paths, flags). Escaping
+# it needs MORE entropy (raise temperature, lower min_p) plus anti-repetition
+# penalties that lower the looping token's logit — the OPPOSITE of sharpening
+# toward greedy. So recovery now RAISES temperature (was 0.2, which made the
+# loop more deterministic) and adds DRY + repeat_penalty. The non-OpenAI knobs
+# ride in extra_body (llama.cpp reads them; other backends ignore unknown keys).
+RECOVERY_TEMPERATURE = _env_float("MINION_RECOVERY_TEMPERATURE", 1.0)
 RECOVERY_TOP_P = _env_float("MINION_RECOVERY_TOP_P", 0.95)
+RECOVERY_MIN_P = _env_float("MINION_RECOVERY_MIN_P", 0.02)
+RECOVERY_REPEAT_PENALTY = _env_float("MINION_RECOVERY_REPEAT_PENALTY", 1.2)
+RECOVERY_REPEAT_LAST_N = _env_int("MINION_RECOVERY_REPEAT_LAST_N", 512)
+RECOVERY_DRY_MULTIPLIER = _env_float("MINION_RECOVERY_DRY_MULTIPLIER", 0.8)
+RECOVERY_DRY_BASE = _env_float("MINION_RECOVERY_DRY_BASE", 1.75)
+RECOVERY_DRY_ALLOWED_LENGTH = _env_int("MINION_RECOVERY_DRY_ALLOWED_LENGTH", 2)
+# Treat path/code punctuation as DRY sequence breakers so a long file path the
+# agent must emit verbatim is never penalized as "repetition".
+RECOVERY_DRY_SEQUENCE_BREAKERS = ["\n", ":", "\"", "*", "/", "\\", "`", "'"]
+# Cut the stream when the model leaks GLM-native control markers it should never
+# emit (the </arg_value> / <arg_key> salad in the gibberish reports). 0 disables.
+LEAK_TOKEN_GUARD = _env_int("MINION_LEAK_TOKEN_GUARD", 1)
 RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
 RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
@@ -1305,6 +1331,42 @@ def parse_text_calls(content):
     return calls
 
 
+def _sanitize_tool_result(text):
+    """Collapse repetitive runs and cap size before a tool result enters the
+    message history. Large, near-duplicate tool outputs (find/ls/grep path
+    dumps) are the fuel for context-copying repetition collapse, so we (1)
+    collapse runs of >=3 identical consecutive lines, then (2) head/tail-cap to
+    TOOL_RESULT_CHARS with a visible marker. Short, non-repetitive results pass
+    through untouched, so normal file reads and command output are unaffected."""
+    if not isinstance(text, str) or len(text) <= 1000:
+        return text
+    lines = text.split("\n")
+    out_lines = []
+    i, n = 0, len(lines)
+    while i < n:
+        j = i + 1
+        while j < n and lines[j] == lines[i]:
+            j += 1
+        run = j - i
+        if run >= 3:
+            out_lines.append(lines[i])
+            out_lines.append(f"... [+{run - 1} identical lines elided]")
+        else:
+            out_lines.extend(lines[i:j])
+        i = j
+    result = "\n".join(out_lines)
+    budget = TOOL_RESULT_CHARS
+    if budget > 0 and len(result) > budget:
+        head = budget * 2 // 3
+        tail = budget - head
+        elided = len(result) - head - tail
+        result = (result[:head]
+                  + f"\n... [{elided} chars elided to bound context; "
+                    f"re-run more narrowly if you need the rest]\n"
+                  + result[-tail:])
+    return result
+
+
 def run_tool(name, args):
     fn = DISPATCH.get(name)
     if not fn:
@@ -1337,8 +1399,12 @@ def run_tool(name, args):
     finally:
         _ACTIVE_SPINNER = None
         spinner.stop()
-    # box the result; truncate absurdly long output for readability (model still
-    # gets the full thing via the messages array)
+    # Dedup + cap the result BEFORE it enters the message history (the model and
+    # the on-screen preview both get this sanitized form). Bounding repetitive
+    # tool output is the cheapest defense against context-copying collapse.
+    result = _sanitize_tool_result(result)
+    # box the result; the preview is a further display-only trim of the (already
+    # context-bounded) result
     preview = result if len(result) < 800 else result[:800] + f"\n... [{len(result) - 800} more chars]"
     for line in preview.splitlines():
         print(f"{CYAN}  │ {RESET}{line}")
@@ -1361,11 +1427,31 @@ def _tool_args_parse_error(c, err, finish_reasons=None):
 
 
 def _recovery_sampling_opts():
+    """Loop-breaking sampler for recovery retries (see RECOVERY_* constants).
+
+    temperature/top_p are standard OpenAI params and go top-level. min_p,
+    repeat_penalty, repeat_last_n and the DRY family are llama.cpp extensions the
+    OpenAI SDK won't accept as kwargs, so they ride in extra_body — llama.cpp's
+    server merges that into the request body; non-llama.cpp endpoints ignore
+    unknown keys. Set any RECOVERY_* value negative to omit it."""
     opts = {}
     if RECOVERY_TEMPERATURE >= 0:
         opts["temperature"] = RECOVERY_TEMPERATURE
     if RECOVERY_TOP_P >= 0:
         opts["top_p"] = RECOVERY_TOP_P
+    extra = {}
+    if RECOVERY_MIN_P >= 0:
+        extra["min_p"] = RECOVERY_MIN_P
+    if RECOVERY_REPEAT_PENALTY >= 0:
+        extra["repeat_penalty"] = RECOVERY_REPEAT_PENALTY
+        extra["repeat_last_n"] = RECOVERY_REPEAT_LAST_N
+    if RECOVERY_DRY_MULTIPLIER > 0:
+        extra["dry_multiplier"] = RECOVERY_DRY_MULTIPLIER
+        extra["dry_base"] = RECOVERY_DRY_BASE
+        extra["dry_allowed_length"] = RECOVERY_DRY_ALLOWED_LENGTH
+        extra["dry_sequence_breakers"] = RECOVERY_DRY_SEQUENCE_BREAKERS
+    if extra:
+        opts["extra_body"] = extra
     return opts
 
 
@@ -1577,6 +1663,35 @@ class _ReasoningLoopSignalCounter:
         return self.hits
 
 
+# GLM-native chat-template control markers that minion's own protocol never
+# emits. When the model leaks these as literal output the decode has almost
+# certainly collapsed — they were prominent in the observed gibberish.
+# Deliberately excludes <think>/<tool_call> (legit reasoning / text tool-call
+# protocol). Two tiers, because file *content* travels through tool args:
+#   STRICT = model-internal specials that never appear in real code/text — safe
+#            to trip on a single hit, even inside tool-call args.
+#   BROAD  = STRICT plus GLM's <arg_key>/<arg_value> XML, which CAN legitimately
+#            appear in a chat-template file someone is editing; only used on the
+#            reasoning/content channels (which never carry written file bodies),
+#            and only with min_hits>=2 to spare incidental mentions in prose.
+_LEAK_TOKEN_STRICT_RE = re.compile(r"<\|[A-Za-z0-9_]{1,32}\|>|\[s?g?MASK\]|</?sop>|</?eop>")
+_LEAK_TOKEN_BROAD_RE = re.compile(
+    r"</?arg_(?:key|value)\s*>|<\|[A-Za-z0-9_]{1,32}\|>|\[s?g?MASK\]|</?sop>|</?eop>")
+
+
+def _leak_token_hit(text, min_hits=1, strict=False):
+    """Return the leaked marker string if `text` contains >= min_hits control
+    markers, else None. strict=True restricts to model-internal specials that are
+    never valid in file content (use on tool-call args)."""
+    if not LEAK_TOKEN_GUARD or not text:
+        return None
+    rx = _LEAK_TOKEN_STRICT_RE if strict else _LEAK_TOKEN_BROAD_RE
+    hits = rx.findall(text)
+    if len(hits) >= min_hits:
+        return hits[0]
+    return None
+
+
 def _reasoning_gibberish_reason(sample):
     """Return a short reason when reasoning text has collapsed into junk.
 
@@ -1759,6 +1874,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     t_first = None   # time of first output token (for TTFT)
     loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
     gibberish = _ReasoningGibberishDetector(REASONING_GIBBERISH_CHARS)
+    content_tail = ""  # rolling tail of streamed content, for leak-token detection
+    args_tail = ""     # rolling tail of streamed tool-call args, same purpose
     loop_cut = False
     loop_cut_reason = "signals"
     gibberish_reason = None
@@ -1839,6 +1956,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             if rc:
                 if not content and not tcs and REASONING_GIBBERISH_CHARS > 0:
                     gibberish_reason = gibberish.feed(rc)
+                    # leaked GLM control markers in the reasoning window are a
+                    # high-signal collapse tell the ratio heuristic can miss
+                    if not gibberish_reason:
+                        leak = _leak_token_hit(gibberish.buf, min_hits=2)
+                        if leak:
+                            gibberish_reason = f"leaked control token {leak!r}"
                     if gibberish_reason:
                         if mode == "think":
                             print()
@@ -1919,6 +2042,21 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 mode = "say"
                 print(d.content, end="", flush=True)
                 content.append(d.content)
+                # leaked GLM control markers in visible output → collapse (the
+                # ratio heuristic only watches the reasoning channel)
+                content_tail = (content_tail + d.content)[-512:]
+                leak = _leak_token_hit(content_tail, min_hits=2)
+                if leak:
+                    print()  # close the green content line
+                    print(f"{RED}  ⚠ OUTPUT GIBBERISH DETECTED — leaked control "
+                          f"token {leak!r}; cutting stream now{RESET}")
+                    loop_cut = True
+                    loop_cut_reason = "gibberish"
+                    gibberish_reason = f"leaked control token {leak!r}"
+                    close = getattr(stream, "close", None)
+                    if close:
+                        close()
+                    break
             for tc in (d.tool_calls or []):
                 # if we were mid-reasoning when tools kicked in, close it out so
                 # the cyan tool box (which starts with its own \n) gets a clean line
@@ -1936,7 +2074,24 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     s["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     s["args"] += tc.function.arguments
+                    # GLM <arg_key>/<arg_value>/pipe-specials are never valid
+                    # JSON tool args — one occurrence is enough to call collapse
+                    if not loop_cut:
+                        args_tail = (args_tail + tc.function.arguments)[-512:]
+                        leak = _leak_token_hit(args_tail, min_hits=1, strict=True)
+                        if leak:
+                            loop_cut = True
+                            loop_cut_reason = "gibberish"
+                            gibberish_reason = f"leaked control token {leak!r} in tool args"
                 show_tool_status()
+            if loop_cut:  # tool-args collapse detected above
+                clear_tool_status()
+                print(f"\n{RED}  ⚠ TOOL-CALL GIBBERISH DETECTED — "
+                      f"{gibberish_reason}; cutting stream now{RESET}")
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+                break
     except (APIError, APIConnectionError, httpx.HTTPError) as e:
         stream_error = e
         close = getattr(stream, "close", None)
