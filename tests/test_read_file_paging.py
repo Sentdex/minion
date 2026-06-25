@@ -87,6 +87,15 @@ def test_offset_past_eof():
     assert out == f"[{path}: 2 lines; offset 99 is past end of file]"
 
 
+def test_empty_file_clear_marker():
+    # An empty file returns a clear marker, not "" (offset 1) or a nonsensical
+    # "lines 5-0 of 0" header (offset > 1), so the model can tell an empty file
+    # apart from a failed read.
+    path = _write("empty.txt", "")
+    assert m.read_file(path) == f"[{path}: empty file]"
+    assert m.read_file(path, offset=5) == f"[{path}: empty file]"
+
+
 def test_limit_zero_reads_to_end():
     path = _write("big4.txt", "".join(f"line{i}\n" for i in range(1, 51)))
     out = m.read_file(path, limit=0)

@@ -251,11 +251,12 @@ out = run_repl_commands(["/autocompress"])
 assert "auto-compress: off" in out, f"bare when off should show off: {out!r}"
 print("  /autocompress (off) → shows off → PASS")
 
-# /autocompress on → re-enables at 85
+# /autocompress on → re-enables at the configured default (85 here)
 out = run_repl_commands(["/autocompress on"])
-assert "auto-compress: 85%" in out, f"/autocompress on should set 85%: {out!r}"
-assert m.AUTOCOMPRESS_PERCENT == 85
-print("  /autocompress on → re-enables 85% → PASS")
+assert f"auto-compress: {m.AUTOCOMPRESS_DEFAULT}%" in out, \
+    f"/autocompress on should restore the configured default: {out!r}"
+assert m.AUTOCOMPRESS_PERCENT == m.AUTOCOMPRESS_DEFAULT
+print(f"  /autocompress on → re-enables {m.AUTOCOMPRESS_DEFAULT}% (configured default) → PASS")
 
 # /autocompress 0 → disables (alias for off)
 out = run_repl_commands(["/autocompress 0"])
@@ -291,6 +292,16 @@ sys.argv = ["minion.py"]
 importlib.reload(m)
 assert m.AUTOCOMPRESS_PERCENT == 60, f"env 60 → {m.AUTOCOMPRESS_PERCENT}"
 print(f"  MINION_AUTOCOMPRESS_PERCENT=60 → {m.AUTOCOMPRESS_PERCENT} → PASS")
+
+# /autocompress on restores the *configured* default (60), not a hardcoded 85.
+assert m.AUTOCOMPRESS_DEFAULT == 60, \
+    f"AUTOCOMPRESS_DEFAULT should track the env default, got {m.AUTOCOMPRESS_DEFAULT}"
+out = run_repl_commands(["/autocompress off", "/autocompress on"])
+assert "auto-compress: 60%" in out, \
+    f"/autocompress on should restore the configured 60%, not 85: {out!r}"
+assert m.AUTOCOMPRESS_PERCENT == 60, \
+    f"on should restore configured 60, got {m.AUTOCOMPRESS_PERCENT}"
+print("  /autocompress off → on restores configured 60% (not hardcoded 85) → PASS")
 
 # clamp upper bound
 os.environ["MINION_AUTOCOMPRESS_PERCENT"] = "150"

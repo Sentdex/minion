@@ -1162,7 +1162,9 @@ def read_file(path, offset=1, limit=None, **_):
         start = max(1, int(offset)) - 1
     except (TypeError, ValueError):
         start = 0
-    if total and start >= total:
+    if total == 0:
+        return f"[{path}: empty file]"
+    if start >= total:
         return f"[{path}: {total} lines; offset {start + 1} is past end of file]"
     if limit is None:
         limit = _env_int("MINION_READ_FILE_LINES", 400)
@@ -1482,7 +1484,7 @@ def _precise_abbr(n):
         return f"{n / 1000:.2f}K"
     if n < 1_000_000_000:
         return f"{n / 1_000_000:.2f}M"
-    return f"{n // 1_000_000_000}B"
+    return f"{n / 1_000_000_000:.2f}B"
 
 REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 36000)
 MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 16000)
@@ -1542,6 +1544,8 @@ RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 # more recent turns so in-progress work isn't disturbed. Set to 0 to disable.
 AUTOCOMPRESS_PERCENT = _env_int("MINION_AUTOCOMPRESS_PERCENT", 85)
 AUTOCOMPRESS_PERCENT = max(0, min(100, AUTOCOMPRESS_PERCENT))  # clamp 0–100
+# What `/autocompress on` restores; falls back to 85 when configured off.
+AUTOCOMPRESS_DEFAULT = AUTOCOMPRESS_PERCENT or 85
 
 FORCED_FINAL_NUDGE = (
     "Your previous streamed response produced reasoning only. Do not continue "
@@ -3435,7 +3439,7 @@ def main():
                 print(f"{DIM}  auto-compress: off (disabled){RESET}")
                 continue
             if arg in ("on", "enable"):
-                AUTOCOMPRESS_PERCENT = 85
+                AUTOCOMPRESS_PERCENT = AUTOCOMPRESS_DEFAULT
                 print(f"{DIM}  auto-compress: {AUTOCOMPRESS_PERCENT}% "
                       f"(auto-compress when context ≥ {AUTOCOMPRESS_PERCENT}% full){RESET}")
                 continue

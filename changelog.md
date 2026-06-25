@@ -2,6 +2,24 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — `read_file` empty-file marker, `/autocompress on`, abbr + docs
+
+- `read_file` on an empty file now returns a clear `[<path>: empty file]` marker
+  instead of an empty string (offset 1) or a nonsensical `lines 2-0 of 0` header
+  (offset > 1), so an empty file is distinguishable from a failed read.
+- `/autocompress on` was resetting to a hardcoded `85`, silently throwing away a
+  custom `MINION_AUTOCOMPRESS_PERCENT` (e.g. `30` → `off` → `on` jumped to 85).
+  It now restores the configured default via the new `AUTOCOMPRESS_DEFAULT`
+  constant — still 85% when unset, and falls back to 85 when configured off so
+  "on" still turns something on.
+- `_precise_abbr` floored the billions branch to an integer (`1B`) even though
+  its docstring promised two decimals like K/M; now `1.50B`.
+- README documents three env vars that were missing from the table:
+  `MINION_ACTIVE`, `MINION_READ_FILE_LINES`, `MINION_EMPTY_TURN_RETRIES`.
+- Tests: new `tests/test_abbr.py`; empty-file case in
+  `tests/test_read_file_paging.py`; `tests/test_autocompress.py` now checks that
+  `on` restores the configured (non-85) default.
+
 ### Added — automatic context compression (`MINION_AUTOCOMPRESS_PERCENT`, `/autocompress`)
 
 minion can now fold older context automatically when the conversation gets
@@ -17,7 +35,8 @@ line. Default **85%** (set `0` to disable).
   on a 170K window fires at ~51K tokens.
 - New `/autocompress` command: bare shows the current threshold/status;
   `/autocompress <1-100>` sets it; `off`/`0`/`disable` disables; `on`/`enable`
-  restores 85%. Takes effect immediately for the next turn.
+  re-enables at the configured `MINION_AUTOCOMPRESS_PERCENT` (85% by default).
+  Takes effect immediately for the next turn.
 - `compress()` gained an `auto=False` param. When `auto=True`, the keep count
   is raised to `max(COMPRESS_KEEP, body_len // 3)` — roughly the last third of
   the conversation stays verbatim — so auto-compress is deliberately more

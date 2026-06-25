@@ -166,12 +166,15 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_APPROVAL` | persistent default approval mode: `all`/`low`/`medium`/`high`/`yolo` (see below). CLI flags `--approval` / `--yolo` override it for a single run. |
 | `MINION_BASE_URL` / `MINION_MODEL` / `MINION_API_KEY` | legacy single-source config (or the `local` fallback) |
 | `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
+| `MINION_ACTIVE` | name of the source to start on (same as `--source`, but persistent; defaults to the first in `MINION_SOURCES`) |
 | `TOGETHER_API_KEY` | auto-registers a built-in `together` source (Together AI, default model `zai-org/GLM-5.2`); override with `MINION_SOURCE_TOGETHER_*` |
 | `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
 | `MINION_MALFORMED_STREAM_RETRIES` | max clean retries for malformed/truncated tool-call args or SSE streams before waiting for user input (default 2) |
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 36000; `0` disables) |
 | `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
+| `MINION_EMPTY_TURN_RETRIES` | auto-continue attempts when the model returns a completely empty turn (no text, no tool call) before dropping to the prompt (default 3; `0` disables) |
 | `MINION_TOOL_RESULT_CHARS` | per-tool-result char cap before it enters message history, to starve context-copying repetition (default 20000; `0` disables the cap, dedup still runs) |
+| `MINION_READ_FILE_LINES` | default number of lines the `read_file` tool returns when no explicit `limit` is given (default 400; `<=0` reads whole files) |
 | `MINION_AUTOCOMPRESS_PERCENT` | auto-compress the conversation when it fills this % of the context window (default 85; `0` disables). Keeps the last ~⅓ of turns verbatim — more conservative than a manual `/compress` (which keeps 2). `/autocompress` adjusts at runtime |
 | `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | standard sampler params used only for recovery retries (defaults `1.0` / `0.95`; negative values omit them) |
 | `MINION_RECOVERY_MIN_P` | min-p floor for recovery retries (llama.cpp extension via `extra_body`; default `0.02`; negative omits it) |
