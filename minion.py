@@ -1146,16 +1146,27 @@ class LifeSpinner:
 #   threads) cleared it. A persistent singleton thread with a clean
 #   arm/disarm protocol has no spawn/join window to leak through.
 #
-# Three events:
-#   _INTERRUPT_ARMED   — "watcher should actively read stdin right now"
-#                        main sets it to start a generation; clears it to park.
-#   _INTERRUPT_EXIT    — "watcher should die entirely" (set once at process exit)
-#   _USER_INTERRUPTED  — "the user actually pressed Esc" — only the watcher sets
-#                        this; main reads it after disarming. Separate from the
-#                        arm flag so disarming to park ≠ "you pressed Esc".
+# Four events:
+#   _INTERRUPT_ARMED    — "watcher should actively read stdin right now"
+#                         main sets it to start a generation; clears it to park.
+#   _INTERRUPT_EXIT     — "watcher should die entirely" (set once at process exit)
+#   _USER_INTERRUPTED   — "the user actually pressed Esc" — only the watcher sets
+#                         this; main reads it after disarming. Separate from the
+#                         arm flag so disarming to park ≠ "you pressed Esc".
+#   _INTERRUPT_RESTORED — "watcher has restored termios to cooked mode" — the
+#                         watcher sets this in its inner finally after tcsetattr.
+#                         main clears it before arming and waits on it after
+#                         disarming so the chatbox never captures the watcher's
+#                         raw-mode termios as its "old" state. Without this
+#                         handshake the disarm is asynchronous (the watcher may
+#                         still be in select(0.1) when the chatbox runs) and the
+#                         chatbox can inherit VMIN=0/ISIG-off, breaking Enter
+#                         and leaving the terminal stuck in raw mode.
 _INTERRUPT_ARMED = threading.Event()
 _INTERRUPT_EXIT = threading.Event()
 _USER_INTERRUPTED = threading.Event()
+_INTERRUPT_RESTORED = threading.Event()
+_INTERRUPT_RESTORED.set()  # initially: nothing to restore (OK to proceed)
 _INTERRUPT_THREAD = None
 
 
@@ -1199,6 +1210,7 @@ def _interrupt_watcher():
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, new)
         except Exception:
+            _INTERRUPT_RESTORED.set()  # never armed — nothing to restore
             return
         try:
             while _INTERRUPT_ARMED.is_set() and not _INTERRUPT_EXIT.is_set():
@@ -1208,6 +1220,7 @@ def _interrupt_watcher():
                 try:
                     c = os.read(fd, 1)
                 except OSError:
+                    _INTERRUPT_RESTORED.set()  # dying — unblock main's wait
                     return
                 if c != b"\x1b":
                     continue  # discard anything that isn't Esc
@@ -1233,6 +1246,10 @@ def _interrupt_watcher():
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
             except Exception:
                 pass
+            # Signal main that termios has been restored to cooked mode.
+            # main waits on this after clearing _INTERRUPT_ARMED so the chatbox
+            # never captures our raw-mode termios as its "old" state.
+            _INTERRUPT_RESTORED.set()
 
 
 def _ensure_interrupt_watcher():
@@ -1247,6 +1264,7 @@ def _ensure_interrupt_watcher():
         return
     _INTERRUPT_EXIT.clear()
     _INTERRUPT_ARMED.clear()
+    _INTERRUPT_RESTORED.set()  # fresh thread: nothing to restore yet
     _USER_INTERRUPTED.clear()
     _INTERRUPT_THREAD = threading.Thread(
         target=_interrupt_watcher, daemon=True, name="minion-interrupt")
@@ -2528,6 +2546,14 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     # while to arrive.
     _ensure_interrupt_watcher()
     _USER_INTERRUPTED.clear()
+    # Clear the "termios restored" flag BEFORE arming so we can wait on it
+    # after disarm. The watcher sets it in its inner finally once it has
+    # restored cooked mode. Without this handshake the watcher's termios
+    # restore is asynchronous (it may still be in select(0.1) when we
+    # return), and the chatbox can capture the watcher's raw-mode termios
+    # as its "old" state — leaving the terminal stuck in VMIN=0/ISIG-off
+    # with broken Enter and garbled typing.
+    _INTERRUPT_RESTORED.clear()
     _INTERRUPT_ARMED.set()
     content, tcs, mode = [], {}, None
     timings = None
@@ -2668,9 +2694,16 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         clear_tool_status()
         # Disarm the watcher: it stops reading stdin, restores termios in its
         # own inner finally, and parks on _INTERRUPT_ARMED until next turn.
-        # No join needed — parking is instant and leak-proof (unlike the old
-        # join(timeout=0.5) which could leave a keystroke-eating zombie).
+        # We MUST wait for _INTERRUPT_RESTORED before returning — otherwise the
+        # watcher's termios restore is asynchronous (it may still be in
+        # select(0.1) when we return) and the chatbox can capture our raw-mode
+        # termios as its "old", leaving the terminal stuck in VMIN=0/ISIG-off.
+        # The watcher's inner select has a 0.1s timeout, so restore typically
+        # completes in <0.1s; the 0.5s timeout is a safety net for the rare
+        # case where the turn was too short for the watcher to even arm (in
+        # which case termios was never changed and there's nothing to restore).
         _INTERRUPT_ARMED.clear()
+        _INTERRUPT_RESTORED.wait(timeout=0.5)
         _USER_INTERRUPTED.clear()
     if stream_error is not None:
         if mode in ("think", "say"):

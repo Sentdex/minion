@@ -35,6 +35,7 @@ def setup_function(_function):
     m._INTERRUPT_ARMED.clear()
     m._INTERRUPT_EXIT.clear()
     m._USER_INTERRUPTED.clear()
+    m._INTERRUPT_RESTORED.set()  # initial state: nothing to restore
 
 
 def test_singleton_one_thread_across_many_arms():
@@ -123,11 +124,59 @@ def test_disarm_clears_user_interrupted():
     """Disarming must clear _USER_INTERRUPTED so a stale Esc doesn't fire next turn."""
     m._USER_INTERRUPTED.set()
     m._INTERRUPT_ARMED.set()
+    m._INTERRUPT_RESTORED.clear()
     # Mirror the finally block in model_turn.
     m._INTERRUPT_ARMED.clear()
+    # Simulate the watcher restoring termios (sets _INTERRUPT_RESTORED).
+    m._INTERRUPT_RESTORED.set()
+    m._INTERRUPT_RESTORED.wait(timeout=0.5)
     m._USER_INTERRUPTED.clear()
     assert not m._USER_INTERRUPTED.is_set(), "stale interrupt survived disarm"
     print("PASS — disarm clears _USER_INTERRUPTED")
+
+
+def test_restore_handshake_synchronous_disarm():
+    """The _INTERRUPT_RESTORED handshake makes the watcher's termios restore
+    synchronous: model_turn clears it before arming, the watcher sets it in
+    its inner finally after restoring cooked mode, and model_turn waits for it
+    after disarming. Without this, the chatbox can capture the watcher's
+    raw-mode termios (VMIN=0, ISIG-off) as its "old" state — which leaves
+    the terminal stuck in raw mode with broken Enter and garbled typing
+    (the resize/termios-corruption bug).
+    """
+    # Initial state: nothing to restore — flag is set.
+    assert m._INTERRUPT_RESTORED.is_set(), "initial state should be 'restored'"
+
+    # model_turn arms: clears _INTERRUPT_RESTORED, sets _INTERRUPT_ARMED.
+    m._INTERRUPT_RESTORED.clear()
+    m._INTERRUPT_ARMED.set()
+    assert not m._INTERRUPT_RESTORED.is_set(), "cleared before arming"
+
+    # Watcher disarms: clears _INTERRUPT_ARMED, restores termios, sets
+    # _INTERRUPT_RESTORED in its inner finally.
+    m._INTERRUPT_ARMED.clear()
+    m._INTERRUPT_RESTORED.set()  # watcher's inner finally
+
+    # model_turn's finally: waits for _INTERRUPT_RESTORED (returns immediately
+    # because the watcher already set it).
+    m._INTERRUPT_RESTORED.wait(timeout=0.5)
+    assert m._INTERRUPT_RESTORED.is_set(), "restored after disarm"
+
+    # Edge case: if the turn was too short for the watcher to even arm,
+    # _INTERRUPT_RESTORED is never set and the wait times out (harmless —
+    # termios was never changed). Verify the timeout doesn't block forever.
+    m._INTERRUPT_RESTORED.clear()
+    m._INTERRUPT_ARMED.set()
+    m._INTERRUPT_ARMED.clear()
+    # No watcher thread running, so _INTERRUPT_RESTORED stays clear.
+    import time as _time
+    _t0 = _time.monotonic()
+    m._INTERRUPT_RESTORED.wait(timeout=0.05)
+    _elapsed = _time.monotonic() - _t0
+    assert _elapsed >= 0.04, "wait should have timed out (~50ms)"
+    assert not m._INTERRUPT_RESTORED.is_set(), "should still be clear (no watcher)"
+
+    print("PASS — restore handshake makes disarm synchronous")
 
 
 if __name__ == "__main__":

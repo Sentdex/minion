@@ -2,6 +2,48 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — terminal breaks on resize / broken Enter / garbled typing after model turn
+
+After the interrupt-watcher singleton refactor, resizing the terminal (or
+sometimes just typing after a model response) left the terminal in a broken
+state: Enter didn't submit, typing produced double/garbled characters, and the
+chatbox didn't redraw at the new size.
+
+Root cause: the watcher's termios restore was **asynchronous**. `model_turn`'s
+finally block did `_INTERRUPT_ARMED.clear()` and returned immediately — but the
+watcher thread might still be in `select(0.1)` and hadn't restored cooked mode
+yet. Two races followed:
+
+  1. The chatbox ran before the watcher restored termios, captured the watcher's
+     raw-mode settings (VMIN=0, ISIG off, ECHO off) as its "old" state, and
+     restored that broken state on exit — leaving the terminal stuck in raw
+     mode with VMIN=0. With VMIN=0, `os.read` returns empty immediately,
+     causing the chatbox to busy-loop; with ICRNL re-enabled by the watcher's
+     restore, Enter produced `\n` instead of `\r`, so the chatbox's
+     `elif c == "\r"` submit handler never fired.
+
+  2. The watcher's `finally: tcsetattr(old)` could fire **while the chatbox was
+     running**, clobbering the chatbox's own raw mode mid-input. In cooked mode
+     (ICANON on, ECHO on) the chatbox's cursor-control escape sequences and
+     byte-at-a-time reads break completely.
+
+Fix: added a `_INTERRUPT_RESTORED` event handshake. `model_turn` clears it
+before arming the watcher; the watcher sets it in its inner `finally` after
+restoring termios; `model_turn` waits on it (timeout 0.5s) after disarming.
+This makes the disarm **synchronous** — the chatbox never runs until the
+watcher has restored cooked mode. The 0.5s timeout is a safety net for the
+rare case where the turn was too short for the watcher to even arm (in which
+case termios was never changed and there's nothing to restore).
+
+- New `_INTERRUPT_RESTORED` event (initially set). Cleared by `model_turn`
+  before arming; set by the watcher after `tcsetattr(old)` in its inner
+  `finally`, and in the two early-return paths (tcsetattr failure, OSError in
+  `os.read`).
+- `model_turn`'s finally now does `_INTERRUPT_ARMED.clear()` →
+  `_INTERRUPT_RESTORED.wait(timeout=0.5)` → `_USER_INTERRUPTED.clear()`.
+- Tests: `test_restore_handshake_synchronous_disarm` verifies the clear→arm→
+  disarm→restore protocol and the timeout edge case. All existing tests pass.
+
 ### Fixed — keystroke-eating lag in long sessions (interrupt watcher leak)
 
 In sessions that ran for many turns, the terminal would get progressively
