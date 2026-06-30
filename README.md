@@ -130,6 +130,45 @@ deliberately over-sized request is rejected with the limit named in the error,
 resolving in well under a second — so the `/<max>` shows up on the first turn
 rather than after a multi-second `/v1/models` round-trip that returns nothing.
 
+#### AWS Bedrock (via LiteLLM proxy)
+
+minion works with any OpenAI-compatible endpoint, so you can use AWS Bedrock
+models by running [LiteLLM](https://github.com/BerriAI/litellm) as a local
+proxy:
+
+```bash
+pip install 'litellm[proxy]'
+litellm --model bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0 --port 4000
+```
+
+Then point minion at it:
+
+```
+MINION_BASE_URL=http://localhost:4000/v1
+MINION_MODEL=bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0
+MINION_API_KEY=sk-noop
+```
+
+LiteLLM reads your standard AWS credentials (`~/.aws/credentials`,
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or SSO/instance profiles).
+Set `AWS_DEFAULT_REGION` if needed. Bedrock requires
+[inference profiles](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html)
+for on-demand throughput — use the `us.` or `global.` prefixed model IDs
+(e.g. `us.anthropic.claude-opus-4-6-v1`) rather than bare model IDs.
+
+A convenience wrapper that auto-starts the proxy:
+
+```bash
+#!/bin/bash
+# save as ~/bin/minion-bedrock and chmod +x
+export AWS_DEFAULT_REGION=us-east-1
+if ! lsof -i :4000 &>/dev/null; then
+  litellm --model bedrock/us.anthropic.claude-opus-4-6-v1 --port 4000 &>/dev/null &
+  sleep 3
+fi
+exec minion "$@"
+```
+
 #### Built-in `together` source
 
 If `TOGETHER_API_KEY` is set (in `~/.env` or your shell), minion auto-registers
