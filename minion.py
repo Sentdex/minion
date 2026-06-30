@@ -48,6 +48,7 @@ import re
 import secrets
 import select
 import shlex
+import unicodedata
 import shutil
 import subprocess
 import sys
@@ -3017,19 +3018,59 @@ def _chatbox_fallback(prompt):
         raise
 
 
+def _char_width(ch):
+    if unicodedata.east_asian_width(ch) in ('W', 'F'):
+        return 2
+    return 1
+
+
+def _str_width(s):
+    return sum(_char_width(c) for c in s)
+
+
+def _str_slice_by_width(s, max_width):
+    """Return the longest prefix of s that fits within max_width display columns."""
+    w = 0
+    for i, ch in enumerate(s):
+        cw = _char_width(ch)
+        if w + cw > max_width:
+            return s[:i]
+        w += cw
+    return s
+
+
 def _raw_read_key(fd):
-    return os.read(fd, 1).decode("utf-8", "replace")
+    b = os.read(fd, 1)
+    if not b:
+        return ""
+    first = b[0]
+    if first < 0x80:
+        return b.decode("ascii")
+    elif first < 0xC0:
+        return b.decode("utf-8", "replace")
+    elif first < 0xE0:
+        need = 1
+    elif first < 0xF0:
+        need = 2
+    else:
+        need = 3
+    for _ in range(need):
+        extra = os.read(fd, 1)
+        if not extra:
+            break
+        b += extra
+    return b.decode("utf-8", "replace")
 
 
 def _raw_read_available(fd, timeout=0.02):
-    parts = []
+    raw = bytearray()
     while True:
         ready, _, _ = select.select([fd], [], [], timeout)
         if not ready:
             break
-        parts.append(os.read(fd, 1).decode("utf-8", "replace"))
+        raw += os.read(fd, 1)
         timeout = 0
-    return "".join(parts)
+    return raw.decode("utf-8", "replace")
 
 
 def _chatbox_raw(initial="", history=None):
@@ -3069,9 +3110,12 @@ def _chatbox_raw(initial="", history=None):
             if not line:
                 visual.append((bi, 0, ""))
                 continue
-            for start in range(0, len(line), inner_w):
-                visual.append((bi, start, line[start:start + inner_w]))
-            if col == len(line) and row == bi and len(line) % inner_w == 0:
+            start = 0
+            while start < len(line):
+                seg = _str_slice_by_width(line[start:], inner_w)
+                visual.append((bi, start, seg))
+                start += len(seg)
+            if col == len(line) and row == bi and _str_width(line[visual[-1][1]:]) == inner_w:
                 visual.append((bi, len(line), ""))
         return visual
 
@@ -3089,23 +3133,23 @@ def _chatbox_raw(initial="", history=None):
                 continue
             if start <= col <= start + len(seg):
                 cur_vrow = i
-                cur_vcol = col - start
+                cur_vcol = _str_width(seg[:col - start])
                 break
 
         hints = "Enter send · Alt+Enter / ^J newline · ^C cancel"
         max_hints = max(0, box_w - 11)
-        if len(hints) > max_hints:
-            hints = hints[:max_hints - 1] + "…" if max_hints > 1 else "…"
-        top_fill = max(0, box_w - 11 - len(hints))
+        if _str_width(hints) > max_hints:
+            hints = _str_slice_by_width(hints, max_hints - 1) + "…" if max_hints > 1 else "…"
+        top_fill = max(0, box_w - 11 - _str_width(hints))
         stats = f"{len(buf)} line{'s' if len(buf) != 1 else ''} · {sum(len(l) for l in buf)} chars"
         max_stats = max(0, box_w - 6)
-        if len(stats) > max_stats:
-            stats = stats[:max_stats - 1] + "…" if max_stats > 1 else "…"
-        bot_fill = max(0, box_w - 4 - len(stats))
+        if _str_width(stats) > max_stats:
+            stats = _str_slice_by_width(stats, max_stats - 1) + "…" if max_stats > 1 else "…"
+        bot_fill = max(0, box_w - 4 - _str_width(stats))
 
         lines = [
             f"{DIM}╭─ {RESET}{CYAN}you{RESET}{DIM} · {hints} {'─' * top_fill}╮{RESET}",
-            *[f"{DIM}│{RESET}{seg:<{inner_w}}{DIM}│{RESET}" for _, _, seg in visual],
+            *[f"{DIM}│{RESET}{seg}{' ' * (inner_w - _str_width(seg))}{DIM}│{RESET}" for _, _, seg in visual],
             f"{DIM}╰─ {stats}{' ' * bot_fill}╯{RESET}",
         ]
 
