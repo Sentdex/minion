@@ -1533,9 +1533,20 @@ def list_dir(path=".", **_):
     return "\n".join(sorted(os.listdir(path)))
 
 
-def run_bash(command, **_):
+def run_bash(command, background=False, **_):
     if not _confirm(f"run: {command}"):
         return "DENIED by user"
+    if background:
+        bg_dir = os.path.join(SESSION_HOME, "bg-logs")
+        os.makedirs(bg_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = f"{stamp}-{secrets.token_hex(3)}"
+        log_path = os.path.join(bg_dir, f"bg-{suffix}.log")
+        wrapped = f"nohup {command} > {log_path} 2>&1 &\necho $!"
+        r = subprocess.run(wrapped, shell=True, capture_output=True,
+                           text=True, timeout=5)
+        pid = r.stdout.strip()
+        return f"[background] PID {pid} | log: {log_path}\nCheck output with read_file('{os.path.abspath(log_path)}')"
     timeout = _env_int("MINION_BASH_TIMEOUT", 120)
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
     out = (r.stdout or "") + (r.stderr or "")
@@ -1558,8 +1569,8 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
     {"type": "function", "function": {"name": "list_dir", "description": "List a directory",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command",
-        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command. Set background=True for long-running commands (servers, watchers, builds) — runs via nohup, logs to ~/.minion/bg-logs/, capped at 1 MB. Read the log with read_file().",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "background": {"type": "boolean", "description": "run in background (default false)"}}, "required": ["command"]}}},
 ]
 
 FINAL_ANSWER_TOOL = {"type": "function", "function": {
@@ -1587,7 +1598,9 @@ Use the provided tools to inspect and modify code. Take one concrete step at a t
 
 If your runtime does NOT support native tool calls, emit a standalone text-protocol call exactly like:
 [minion_tool_call]{"name": "read_file", "arguments": {"path": "foo.py"}}[/minion_tool_call]
-Emit nothing before or after a tool call; wait for the Observation. When showing a tool-call example, use prose or a code block so it is not a standalone tool call. When the task is done, reply in plain prose."""
+Emit nothing before or after a tool call; wait for the Observation. When showing a tool-call example, use prose or a code block so it is not a standalone tool call. When the task is done, reply in plain prose.
+
+For long-running shell commands (servers, watchers, builds), set `background=True` on run_bash — it runs detached via nohup and you can read the log file to check output."""
 
 
 def _env_int(name, default):
@@ -2069,40 +2082,53 @@ def _assess_risk(action):
         {"role": "system", "content": RISK_SYSTEM},
         {"role": "user", "content": _risk_user_message(action)},
     ]
-    attempts = max(0, RISK_CONNECTION_RETRIES) + 1
+    max_conn = max(0, RISK_CONNECTION_RETRIES) + 1
+    max_parse = 3
     try:
-        for attempt in range(attempts):
+        for parse_attempt in range(max_parse):
+            resp = None
+            for conn_attempt in range(max_conn):
+                try:
+                    _log_event("req", {"model": MODEL, "messages": payload,
+                                       "stream": False, "_purpose": "risk",
+                                       "_attempt": conn_attempt + 1,
+                                       "_parse_attempt": parse_attempt + 1})
+                    resp = client.chat.completions.create(
+                        model=MODEL, messages=payload, stream=False, timeout=15,
+                        **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+                    break
+                except APIConnectionError:
+                    if conn_attempt >= max_conn - 1:
+                        return ("high", f"server unreachable after {max_conn} attempts; defaulting to high")
+                    time.sleep(max(0, RISK_CONNECTION_RETRY_SECONDS))
+            if resp is None:
+                return ("high", "no response; defaulting to high")
             try:
-                _log_event("req", {"model": MODEL, "messages": payload,
-                                   "stream": False, "_purpose": "risk",
-                                   "_attempt": attempt + 1})
-                resp = client.chat.completions.create(
-                    model=MODEL, messages=payload, stream=False, timeout=15,
-                    **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
-                break
-            except APIConnectionError:
-                if attempt >= attempts - 1:
-                    return ("high", f"server unreachable after {attempts} attempts; defaulting to high")
-                time.sleep(max(0, RISK_CONNECTION_RETRY_SECONDS))
-        try:
-            _log_event("resp", {"_purpose": "risk", "data": resp.model_dump()})
-        except Exception:
-            pass
-        text = (resp.choices[0].message.content or "").strip()
-        # Try JSON first; fall back to scanning for a level word.
-        level, reason = None, ""
-        try:
-            obj = json.loads(text)
-            level = (obj.get("level") or "").strip().lower()
-            reason = (obj.get("reason") or "").strip()
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            m = re.search(r'\b(low|medium|high)\b', text, re.IGNORECASE)
-            if m:
-                level = m.group(1).lower()
-            reason = text[:120]
-        if level not in LEVEL_ORDER:
-            return ("high", f"unparseable risk response: {text[:80]!r}")
-        return (level, reason or level)
+                _log_event("resp", {"_purpose": "risk", "data": resp.model_dump()})
+            except Exception:
+                pass
+            text = (resp.choices[0].message.content or "").strip()
+            level, reason = None, ""
+            try:
+                obj = json.loads(text)
+                level = (obj.get("level") or "").strip().lower()
+                reason = (obj.get("reason") or "").strip()
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                m = re.search(r'\b(low|medium|high)\b', text, re.IGNORECASE)
+                if m:
+                    level = m.group(1).lower()
+                reason = text[:120]
+            if level in LEVEL_ORDER:
+                return (level, reason or level)
+            # Unparseable — add a sharp follow-up instruction and retry
+            if parse_attempt < max_parse - 1:
+                payload.append({"role": "assistant", "content": text or "(no output)"})
+                payload.append({"role": "user", "content": (
+                    "Respond with ONLY a single JSON object containing \"level\" and \"reason\" fields. "
+                    "No preamble, no explanation, no markdown. Example:\n"
+                    '{"level": "medium", "reason": "edits a file in the project"}'
+                )})
+        return ("high", f"unparseable risk response after {max_parse} attempts: {text[:80]!r}")
     except Exception as e:
         return ("high", f"risk call failed: {type(e).__name__}")
 
