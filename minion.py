@@ -35,7 +35,7 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /memory save|remember|list  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
@@ -124,6 +124,11 @@ def _sessions_dir():
         os.environ.get("MINION_SESSIONS_DIR",
                        os.path.join(SESSION_HOME, "sessions"))
     )
+
+
+def _memories_dir():
+    """Where memory files live. Always under SESSION_HOME/memories."""
+    return os.path.join(SESSION_HOME, "memories")
 
 
 def _new_session_id():
@@ -1533,31 +1538,322 @@ def list_dir(path=".", **_):
     return "\n".join(sorted(os.listdir(path)))
 
 
-def run_bash(command, background=False, **_):
+def _run_bash(command):
+    """Launch `command` detached in its own session and return (pid, log_path).
+
+    The command is started with ``setsid`` so it runs in a **new session / new
+    process group**, fully detached from minion's controlling terminal. This is
+    important: with plain ``nohup`` the background job stays in minion's
+    process group, so a terminal Ctrl+C (SIGINT to the foreground group) kills
+    it — exactly the failure mode that kept canceling long ``docker pull``s
+    mid-extraction. ``nohup`` only ignores SIGHUP, not SIGINT; ``setsid`` puts
+    the job beyond the reach of terminal-generated signals entirely.
+
+    Exit-code capture is inlined into a single ``sh -c`` invocation so no
+    wrapper script is needed — avoids a race where the launcher starts after
+    the temp file is already deleted.
+
+    Stores a ``bg-pid-{pid}.map`` file (JSON ``{"log_path": "…"}``) so
+    ``wait_background`` can locate logs by PID later.
+    """
+    _delete_old_bg_logs()
+    bg_dir = os.path.join(SESSION_HOME, "bg-logs")
+    os.makedirs(bg_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = f"{stamp}-{secrets.token_hex(3)}"
+    log_path = os.path.join(bg_dir, f"bg-{suffix}.log")
+    # Inline: run the command in a subshell, then echo its exit status.
+    # setsid detaches into a new session so terminal Ctrl+C / SIGINT can't
+    # reach the background job. Redirect to the log file ourselves.
+    inner = f"({command}); echo \"[exit: $?]\""
+    wrapped = (f"setsid sh -c {shlex.quote(inner)} > {shlex.quote(log_path)} 2>&1 < /dev/null &\n"
+               f"echo $!")
+    r = subprocess.run(wrapped, shell=True, capture_output=True, text=True)
+    pid = r.stdout.strip()
+    # Write a tiny pid→logpath map file so wait_background can find it.
+    try:
+        map_path = os.path.join(bg_dir, f"bg-pid-{pid}.map")
+        with open(map_path, "w") as f:
+            json.dump({"log_path": log_path}, f)
+    except OSError:
+        pass
+    return pid, log_path
+
+
+def _delete_old_bg_logs(max_logs=50, max_age_days=7):
+    """Trim background logs so they don't pile up forever.
+
+    Also removes stale ``bg-pid-*.map`` files whose target log no longer exists.
+    """
+    bg_dir = os.path.join(SESSION_HOME, "bg-logs")
+    try:
+        log_entries = []
+        map_entries = []
+        for name in os.listdir(bg_dir):
+            if not name.startswith("bg-"):
+                continue
+            p = os.path.join(bg_dir, name)
+            try:
+                if name.endswith(".map"):
+                    map_entries.append((os.path.getmtime(p), p, name))
+                else:
+                    log_entries.append((os.path.getmtime(p), p, name))
+            except OSError:
+                continue
+        now = time.time()
+        # remove logs by age
+        for mtime, p, _ in log_entries:
+            if (now - mtime) > max_age_days * 86400:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # then cap log count (keep newest)
+        log_entries.sort(key=lambda x: x[0], reverse=True)
+        for _, p, _ in log_entries[max_logs:]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        # Clean stale map files (no corresponding log) and age-prune maps too
+        for mtime, p, _ in map_entries:
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+                target = data.get("log_path", "")
+                should_del = not os.path.exists(target)
+            except (OSError, json.JSONDecodeError):
+                should_del = True
+            if not should_del and (now - mtime) > max_age_days * 86400:
+                should_del = True
+            if should_del:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _poll_pid(pid, timeout, check_esc=False):
+    """Poll *pid* up to *timeout* seconds.
+
+    Returns:
+        "exited"      — process finished
+        "timeout"     — poll window expired, process still alive
+        "interrupted" — Esc was pressed (only if *check_esc* is True)
+
+    Uses ``os.kill(pid, 0)`` (a kernel-level signal-0 probe) instead of
+    shelling out to the external ``kill`` binary.  Some minimal Docker
+    images (Alpine/busybox without ``procps``) don't ship a ``kill``
+    executable in PATH, which caused *every* ``run_bash`` call to raise
+    ``FileNotFoundError`` — the agent could run no shell commands at all.
+    ``os.kill`` talks to the kernel directly, so it works in any
+    environment with a POSIX layer, no external binary required.
+
+    Signal-0 semantics:
+      • returns normally    → process exists and is signalable → alive
+      • ProcessLookupError  → ESRCH, no such process            → exited
+      • PermissionError     → EPERM, process exists but not ours → alive
+      • ValueError          → pid wasn't a valid int             → exited
+    """
+    deadline = time.time() + timeout
+    try:
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return "exited"  # no valid pid → the command never started
+    while time.time() < deadline:
+        try:
+            os.kill(pid_i, 0)
+        except ProcessLookupError:
+            return "exited"
+        except PermissionError:
+            pass  # process exists but owned by another uid — still alive
+        except OSError:
+            return "exited"  # unexpected (e.g. EINTR); bail to be safe
+        if check_esc and _USER_INTERRUPTED.is_set():
+            return "interrupted"
+        time.sleep(0.1)
+    return "timeout"
+
+
+def _read_log(log_path):
+    """Read *log_path*, parse the trailing ``[exit: N]`` marker, return (content, exit_code)."""
+    try:
+        with open(log_path, "rb") as f:
+            out = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "", None
+    exit_code = None
+    last_nl = out.rstrip("\n").rfind("\n")
+    trailer = out[last_nl + 1:].strip() if last_nl != -1 else out.strip()
+    m = re.match(r"\[exit:\s*(-?\d+)]", trailer)
+    if m:
+        exit_code = int(m.group(1))
+        out = out[:last_nl] if last_nl != -1 else ""
+    return out, exit_code
+
+
+def _infer_timeout_from_sleep(command, default):
+    """If *command* contains ``sleep N`` (with N in seconds), return a poll
+    timeout that's ``max(N) + 10``, so the command finishes synchronously
+    without the model having to remember ``timeout=N``.
+
+    This compensates for the natural habit of writing
+    ``run_bash("sleep 30 && cat …")`` — a pattern that *seems* like it should
+    block (the shell waits, then cats) but is itself launched via nohup, so
+    it gets backgrounded after ~3 s just like anything else.  By recognising
+    the sleep we make the "obvious" pattern work again.
+    """
+    import re
+    max_sleep = 0
+    for m in re.finditer(r'(?:^|[;&|]\s*)sleep\s+(\d+)', command):
+        n = int(m.group(1))
+        if n > max_sleep:
+            max_sleep = n
+    if max_sleep > 0:
+        return max_sleep + 10
+    return default
+
+
+def run_bash(command, timeout=None, **_):
+    """Run a shell command.
+
+    Commands always run via nohup — they never block the agent loop.
+    If the command finishes within a short poll window (~3 s by default),
+    output is returned directly and the log file is deleted.  If it's still
+    running after the poll window, it continues in the background and you
+    get a PID + log path to check later with ``read_file``.
+
+    **Do NOT use** ``sleep N && …`` inside the command string as a way to
+    wait — the entire command is launched via nohup so *it* will also be
+    backgrounded after a few seconds.  Instead, pass ``timeout=N`` to tell
+    minion to wait synchronously (e.g. ``timeout=35`` for a ``sleep 30``
+    command).  As a convenience, if your command *does* start with
+    ``sleep N …`` the tool auto-extends its poll window to ``N+10`` s
+    so the "obvious" pattern still works.
+
+    Use ``timeout=0`` to wait *indefinitely* (the tool blocks until the
+    command completes).  To wait for an **already-backgrounded** command,
+    use ``wait_background(pid=…)``.
+
+    Long-running commands (servers, watchers, builds) produce background logs
+    at ``~/.minion/bg-logs/``, automatically cleaned up (max ~50 files /
+    7 days).  Pressing Esc during the poll window immediately backgrounds
+    the command.
+    """
     if not _confirm(f"run: {command}"):
         return "DENIED by user"
-    if background:
-        bg_dir = os.path.join(SESSION_HOME, "bg-logs")
-        os.makedirs(bg_dir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        suffix = f"{stamp}-{secrets.token_hex(3)}"
-        log_path = os.path.join(bg_dir, f"bg-{suffix}.log")
-        wrapped = f"nohup {command} > {log_path} 2>&1 &\necho $!"
-        r = subprocess.run(wrapped, shell=True, capture_output=True,
-                           text=True, timeout=5)
-        pid = r.stdout.strip()
-        return f"[background] PID {pid} | log: {log_path}\nCheck output with read_file('{os.path.abspath(log_path)}')"
-    timeout = _env_int("MINION_BASH_TIMEOUT", 120)
-    r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
-    out = (r.stdout or "") + (r.stderr or "")
-    # Big safety slice to bound memory; _sanitize_tool_result applies the real
-    # per-result context budget (TOOL_RESULT_CHARS) with dedup.
-    return f"[exit {r.returncode}]\n{out[:200000]}"
+    if timeout is None:
+        timeout = _env_int("MINION_BASH_POLL_SECONDS", 3)
+        timeout = _infer_timeout_from_sleep(command, timeout)
+    if timeout <= 0:
+        timeout = 999999999  # ∞ — wait indefinitely
+    pid, log_path = _run_bash(command)
+    status = _poll_pid(pid, timeout, check_esc=True)
+    if status == "interrupted":
+        _log_event("tool", f"run_bash interrupted by user while polling (pid {pid})")
+        return (f"[background] PID {pid} | log: {log_path}\n"
+                "The command was interrupted (Esc pressed) and is now running "
+                "in the background. "
+                f"Check output with read_file('{os.path.abspath(log_path)}')")
+    if status == "timeout":
+        return (f"[background] PID {pid} | log: {log_path}\n"
+                "The command is still running in the background. "
+                f"Check output with read_file('{os.path.abspath(log_path)}')")
+    time.sleep(0.2)  # brief settle so the log is flushed
+    out, exit_code = _read_log(log_path)
+    # Delete the log — quick commands leave no trace.
+    try:
+        os.remove(log_path)
+    except OSError:
+        pass
+    if exit_code is not None:
+        return f"[exit {exit_code}]\n{out}"
+    return f"[exited]\n{out}"
+
+
+def wait_background(pid, log_path=None, timeout=0, **_):
+    """Wait for a backgrounded command (started by ``run_bash``) to finish.
+
+    Polls *pid* until it exits (default: wait indefinitely).  When the command
+    exits the output is returned and the log file is cleaned up.  Esc can be
+    pressed at any time to interrupt the wait — the command keeps running and
+    the log path is returned so you can check back later.
+
+    Pass ``timeout=N`` only if you specifically want to bail after N seconds
+    (rarely useful — you called this because you want to *wait*, not guess a
+    ceiling).
+
+    Parameters
+    ----------
+    pid : int or str
+        The PID returned by the prior ``run_bash`` call.
+    log_path : str, optional
+        The log path from the background message.  If omitted the tool scans
+        ``~/.minion/bg-logs/`` for a log whose PID matches.
+    timeout : int
+        Max seconds to wait (default 0 = wait indefinitely until the command
+        finishes or Esc is pressed).
+    """
+    pid = int(pid)
+    if not log_path:
+        log_path = _find_bg_log_for_pid(pid)
+        if not log_path:
+            return (f"[error] No background log found for PID {pid}. "
+                    "The log may have been cleaned up already.")
+    timeout_s = 999999999 if timeout <= 0 else timeout
+    status = _poll_pid(pid, timeout_s, check_esc=True)
+    if status == "interrupted":
+        return (f"[interrupted] PID {pid} still running. "
+                f"Check later with read_file('{os.path.abspath(log_path)}')")
+    if status == "timeout":
+        return (f"[timeout after {timeout}s] PID {pid} still running. "
+                f"Check output so far with read_file('{os.path.abspath(log_path)}')")
+    time.sleep(0.2)
+    out, exit_code = _read_log(log_path)
+    try:
+        os.remove(log_path)
+    except OSError:
+        pass
+    if exit_code is not None:
+        return f"[exit {exit_code}]\n{out}"
+    return f"[exited]\n{out}"
+
+
+def _find_bg_log_for_pid(pid):
+    """Look up the log path for a background PID via the pid→log map files
+    written by ``_run_bash``.  Returns the log path, or None if not found."""
+    pid = str(pid)
+    bg_dir = os.path.join(SESSION_HOME, "bg-logs")
+    map_path = os.path.join(bg_dir, f"bg-pid-{pid}.map")
+    try:
+        with open(map_path) as f:
+            data = json.load(f)
+        return data.get("log_path")
+    except (OSError, IOError, json.JSONDecodeError):
+        pass
+    # Fallback: try to find a log file that mentions this PID in the first 1K
+    try:
+        for name in os.listdir(bg_dir):
+            if not name.startswith("bg-") or ".map" in name:
+                continue
+            p = os.path.join(bg_dir, name)
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(1024).decode("utf-8", errors="replace")
+                if pid in head:
+                    return p
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
 
 
 DISPATCH = {
     "read_file": read_file, "write_file": write_file, "edit_file": edit_file,
-    "list_dir": list_dir, "run_bash": run_bash,
+    "list_dir": list_dir, "run_bash": run_bash, "wait_background": wait_background,
 }
 
 TOOLS = [
@@ -1569,8 +1865,10 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
     {"type": "function", "function": {"name": "list_dir", "description": "List a directory",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command. Set background=True for long-running commands (servers, watchers, builds) — runs via nohup, logs to ~/.minion/bg-logs/, capped at 1 MB. Read the log with read_file().",
-        "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "background": {"type": "boolean", "description": "run in background (default false)"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command. Commands are launched detached (setsid — their own session/process group, immune to terminal Ctrl+C) and never block the agent loop. If the command finishes within a short poll window (~3 s by default), output is returned directly; otherwise it continues in the background and you get a PID + log path to check later with read_file() or wait_background(). Do NOT use `sleep N` as a chaining trick inside the command string — it'll background too. For long commands (docker pull, builds, servers), DON'T pass a big timeout — just let it background and then call wait_background(pid=...) which waits indefinitely. Only pass `timeout=N` for commands you KNOW finish in ~N seconds (e.g. timeout=35 for `sleep 30`). As a convenience, if your command does start with `sleep N ...` the tool auto-extends the poll window to N+10 s. Background logs at ~/.minion/bg-logs/, auto-cleaned (max ~50 files / 7 days).",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "Seconds to wait for the command to finish synchronously (default unset = ~3 s poll; 0 = wait indefinitely). Only set this when you KNOW the command finishes in ~N seconds — for unknown-duration commands, let it background and use wait_background instead."}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "wait_background", "description": "Wait for a backgrounded command (previously started by run_bash) to finish and return its output. By default waits indefinitely until the command completes or Esc is pressed (which leaves it running in the background — Esc cancels the WAIT, never the process). Pass `timeout=N` only if you specifically want to bail after N seconds — but usually you should just let it wait, since you can always Esc out. Locate the log via the `pid` (auto-located) or pass `log_path` explicitly. Note: this tool only polls the process (kill -0); it never sends a signal to the background command, so waiting cannot kill it.",
+        "parameters": {"type": "object", "properties": {"pid": {"type": "integer", "description": "PID of the background command to wait for"}, "log_path": {"type": "string", "description": "Log file path from the background message (optional — auto-located by PID if omitted)"}, "timeout": {"type": "integer", "description": "Max seconds to wait (default 0 = wait indefinitely; almost never set this — Esc works as the cancel)"}}, "required": ["pid"]}}},
 ]
 
 FINAL_ANSWER_TOOL = {"type": "function", "function": {
@@ -1600,7 +1898,13 @@ If your runtime does NOT support native tool calls, emit a standalone text-proto
 [minion_tool_call]{"name": "read_file", "arguments": {"path": "foo.py"}}[/minion_tool_call]
 Emit nothing before or after a tool call; wait for the Observation. When showing a tool-call example, use prose or a code block so it is not a standalone tool call. When the task is done, reply in plain prose.
 
-For long-running shell commands (servers, watchers, builds), set `background=True` on run_bash — it runs detached via nohup and you can read the log file to check output."""
+For shell commands, you never need to worry about blocking — commands run detached (setsid) automatically. Quick ones (a few seconds) return output directly; long-running ones (servers, builds, docker pulls) get backgrounded and you'll get the PID + log path. **Do NOT use `sleep N && …`** as a chaining trick — the whole command is detached so it'll background too. For long commands of unknown duration (docker pull, builds), let them background and then call `wait_background(pid=...)` — it waits indefinitely until the command finishes, and you (or the user) can Esc out at any time (Esc cancels the WAIT, never the process). Only pass `timeout=N` to run_bash when you KNOW the command finishes in ~N seconds (e.g. `timeout=35` for `sleep 30`). Never guess a big timeout for an unknown-duration command.
+
+Operating principles for long background commands (docker pull/build, git clone of big repos, torch.compile, CUDA graph builds):
+- A process that has produced no new log output is NOT necessarily dead. Docker's layer-extraction phase, AOT compilation, and many CUDA/graph-cache builds are legitimately silent for minutes. Distinguish "no output" from "no progress": check `/proc/<pid>/io` read/write bytes, `du -sh` of the target dir, or CPU% via `ps` BEFORE declaring a hang.
+- NEVER `pkill -f '<the thing we just started>'` as a "clean restart". That destroys a job that may be 99% done and restarts it from the same wall. If a backgrounded long command appears stuck, first PROVE it's stuck (ps, /proc/<pid>/io, du), and only kill it if it's genuinely hung.
+- Treat exit 130 (SIGINT) / `context canceled` as a signal-of-a-signal, not a command failure. When a backgrounded command dies with 130, the first hypothesis should be "something interrupted it," not "the command failed." Check the command's own logs / journalctl for `context canceled` before retrying.
+- For long silent-tail commands (docker pull, docker build, big git clone), prefer the background-and-wait pattern: `run_bash(cmd)` → let it background → `wait_background(pid)`. Don't hammer it with sleep-poll loops."""
 
 
 def _env_int(name, default):
@@ -1862,6 +2166,59 @@ RECOVERY_DRY_ALLOWED_LENGTH = None if RECOVERY_BACKEND == "vllm" else _env_int("
 # agent must emit verbatim is never penalized as "repetition".
 RECOVERY_DRY_SEQUENCE_BREAKERS = None if RECOVERY_BACKEND == "vllm" else ["\n", ":", "\"", "*", "/", "\\", "`", "'"]
 
+# --- leaked special-token collapse ------------------------------------------
+# Some models (notably DeepSeek-V4 served via vLLM with dspark speculative
+# decoding) will, when destabilized (e.g. by a harness error like a missing
+# `kill` binary), collapse into spamming their tokenizer-internal special
+# tokens.  The clearest signal is the DeepSeek begin/end-of-sentence token
+# with a FULL-WIDTH pipe (｜, U+FF5C) and SentencePiece marker (▁):
+#   <｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>...
+# These NEVER appear in legitimate model output — they are the tokenizer's
+# internal representation, not a string the model would legitimately emit or
+# discuss.  (Contrast with half-width "<|endoftext|>" which GPT-2 tasks may
+# legitimately reference.)  Once leaked, the spam enters the assistant message
+# history and on the next turn the model sees its own gibberish in context,
+# reinforcing the collapse and often drifting into regurgitated training data
+# (Chinese-language passages are a common artifact).
+
+# Tokenizer-internal markers that are ALWAYS leaks — never legitimate output.
+# Full-width pipe (｜ = U+FF5C) + SentencePiece ▁ = U+2581.
+_LEAKED_SPECIAL_TOKEN_RE = re.compile(
+    r"<\｜(?:begin▁of▁sentence|end▁of▁sentence|tool▁calls▁begin|tool▁calls▁end"
+    r"|tool▁call▁begin|tool▁call▁end|reasoning▁begin|reasoning▁end)\｜>"
+)
+# When a leak run is detected in-stream, cut after this many leaked chunks.
+LEAKED_TOKEN_RUN_LIMIT = _env_int("MINION_LEAKED_TOKEN_RUN_LIMIT", 3)
+# Also detect the degeneration via repeated identical content chunks.  If the
+# last N streamed chunks are byte-identical AND short (<=40 chars), the model
+# is in a repetition collapse — cut the stream and recover.
+REPEAT_CHUNK_LIMIT = _env_int("MINION_REPEAT_CHUNK_LIMIT", 6)
+
+
+def _strip_leaked_tokens(text):
+    """Remove tokenizer-internal special tokens that leaked into model output.
+
+    DeepSeek's ``<｜begin▁of▁sentence｜>`` (full-width pipe) is a tokenizer
+    artifact that should never appear in content; it signals the model has
+    degenerated into a special-token repetition collapse.  Stripping it
+    (a) keeps the user-visible output clean, and crucially (b) prevents the
+    spam from entering the assistant message history where the model would
+    see it on the next turn and have the collapse reinforced.
+    """
+    if not text:
+        return text
+    return _LEAKED_SPECIAL_TOKEN_RE.sub("", text)
+
+
+def _is_leak_chunk(chunk):
+    """True if a streamed content/reasoning chunk is (mostly) leaked special
+    tokens — i.e. the model has entered the special-token collapse."""
+    if not chunk:
+        return False
+    stripped = _LEAKED_SPECIAL_TOKEN_RE.sub("", chunk)
+    # If removing the leaked tokens leaves almost nothing, this chunk was spam.
+    return len(stripped.strip()) <= 2 and bool(_LEAKED_SPECIAL_TOKEN_RE.search(chunk))
+
 # Default sampling params for normal (non-recovery) completions.
 # Set these to get deterministic/greedy output: MINION_TEMPERATURE=0
 # MINION_TOP_P is only relevant when temperature > 0; set to 1 for full
@@ -1912,10 +2269,15 @@ AUTOCOMPRESS_DEFAULT = AUTOCOMPRESS_PERCENT or 85
 # Only on the LAST retry do we ask for a final answer (forced_final=True).
 REASONING_STALL_NUDGE = (
     "Your previous response was reasoning only — you produced no tool calls and "
-    "no visible output. Stop planning in your head. Act now: emit the next tool "
-    "call or write the file you were thinking about. If you were analyzing the "
-    "problem, pick the most promising approach and execute it. Do not produce a "
-    "final answer unless the task is truly complete."
+    "no visible output. Stop planning in your head. ACT NOW, in this order:\n"
+    "1. write_file — create the deliverable file the task asks for (e.g. /app/solution.py, "
+    "/app/main.rs, the output file the verifier checks). Put your best current approach "
+    "into code, even if it's a first draft. An imperfect file you can iterate on beats a "
+    "perfect plan that lives only in your head.\n"
+    "2. run_bash — run it to see what happens (python3 /app/solution.py, cargo run, etc.).\n"
+    "3. edit_file / write_file — fix what the run told you was wrong, then re-run.\n"
+    "Do not produce a final_answer until the deliverable file exists and runs. Pick the "
+    "most promising approach from your reasoning and execute it right now."
 )
 FORCED_FINAL_NUDGE = (
     "Your previous streamed response produced reasoning only. Do not continue "
@@ -2858,6 +3220,9 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     finish_reasons = []
     tool_status_active = False
     last_tool_status = 0.0
+    leaked_token_run = 0   # consecutive leaked-special-token chunks seen
+    repeat_chunk_run = 0   # consecutive identical short chunks (repetition collapse)
+    last_chunk = None      # for repeat-chunk detection
 
     def show_tool_status(force=False):
         nonlocal tool_status_active, last_tool_status
@@ -2933,12 +3298,33 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 if mode != "think":
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
-                print(f"{DIM}{rc}{RESET}", end="", flush=True)
-                reasoning_parts.append(rc)
+                # Sanitize leaked special tokens so they never enter history.
+                if _LEAKED_SPECIAL_TOKEN_RE.search(rc):
+                    rc = _strip_leaked_tokens(rc)
+                    leaked_token_run += 1
+                else:
+                    leaked_token_run = 0
+                if rc.strip():
+                    print(f"{DIM}{rc}{RESET}", end="", flush=True)
+                    reasoning_parts.append(rc)
                 if not content and not tcs:
                     reasoning_only_chars += len(rc)
                     if reasoning_only_start is None:
                         reasoning_only_start = time.time()
+                # Cut the stream if the model has collapsed into special-token
+                # spam (detected via consecutive leaked-token chunks).
+                if LEAKED_TOKEN_RUN_LIMIT > 0 and leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT:
+                    print()
+                    print(f"{RED}  ⚠ LEAKED-TOKEN COLLAPSE — {leaked_token_run} consecutive "
+                          f"special-token chunks; cutting stream now{RESET}")
+                    loop_cut = True
+                    close = getattr(stream, "close", None)
+                    if close:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                    break
                 # Check the char-based limit (fires when reasoning exceeds
                 # REASONING_ONLY_CHAR_LIMIT chars without any content/tool call).
                 if (REASONING_ONLY_CHAR_LIMIT > 0 and not content and not tcs
@@ -2979,9 +3365,43 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     print(f"{DIM}  ──────────────{RESET}")
                 print(f"{GREEN}", end="")
                 mode = "say"
-                print(d.content, end="", flush=True)
-                content.append(d.content)
-                streamed_chars += len(d.content)
+                # Sanitize leaked special tokens before display + history.
+                chunk = d.content
+                if _LEAKED_SPECIAL_TOKEN_RE.search(chunk):
+                    chunk = _strip_leaked_tokens(chunk)
+                    leaked_token_run += 1
+                else:
+                    leaked_token_run = 0
+                # Repetition-collapse detection: short identical chunks
+                # repeated in a row (e.g. "import" over and over).
+                if REPEAT_CHUNK_LIMIT > 0 and chunk and len(chunk) <= 40:
+                    if chunk == last_chunk:
+                        repeat_chunk_run += 1
+                    else:
+                        repeat_chunk_run = 1
+                        last_chunk = chunk
+                else:
+                    repeat_chunk_run = 0
+                if chunk.strip():
+                    print(chunk, end="", flush=True)
+                    content.append(chunk)
+                    streamed_chars += len(chunk)
+                # Cut the stream on a special-token collapse or repetition loop.
+                if ((LEAKED_TOKEN_RUN_LIMIT > 0 and leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT)
+                        or (REPEAT_CHUNK_LIMIT > 0 and repeat_chunk_run >= REPEAT_CHUNK_LIMIT)):
+                    kind = ("special-token collapse" if leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT
+                            else "repetition collapse")
+                    print(RESET)
+                    print(f"{RED}  ⚠ {kind.upper()} — cutting stream now; "
+                          f"discarding degenerated output{RESET}")
+                    loop_cut = True
+                    close = getattr(stream, "close", None)
+                    if close:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                    break
             for tc in (d.tool_calls or []):
                 # if we were mid-reasoning when tools kicked in, close it out so
                 # the cyan tool box (which starts with its own \n) gets a clean line
@@ -3057,6 +3477,10 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         print(f"{DIM}  ──────────────{RESET}")
     print(RESET)
     text = "".join(content)
+    # Final defense-in-depth sanitization: strip any leaked special tokens
+    # that slipped through the per-chunk stripping (e.g. a single token at the
+    # very end of a stream that got cut before the run limit triggered).
+    text = _strip_leaked_tokens(text)
     elapsed = time.time() - t0
 
     if interrupted:
@@ -3075,6 +3499,29 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         loop_cut = True
 
     if loop_cut:
+        # A leaked-token or repetition collapse is a degeneration, not a
+        # reasoning stall — the model was emitting real content (or reasoning)
+        # but it degenerated into gibberish.  Treat it like a malformed stream:
+        # discard the degenerated output and nudge the model to produce clean
+        # output from the current conversation state.  This runs BEFORE the
+        # reasoning-stall logic so we don't mis-classify a collapse as a stall.
+        is_leak_collapse = (leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT
+                           or repeat_chunk_run >= REPEAT_CHUNK_LIMIT)
+        if is_leak_collapse and not forced_final:
+            collapse_type = ("special-token collapse" if leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT
+                             else "repetition collapse")
+            print(f"{YELLOW}  ✂ {collapse_type.upper()} — discarding degenerated "
+                  f"output and nudging clean recovery{RESET}")
+            # Do NOT feed the degenerated reasoning/content back — it's spam
+            # that would reinforce the collapse on the next turn.  Nudge fresh.
+            _nudge_current_user_turn(messages,
+                "Your previous output degenerated into a repetition collapse "
+                "(repeated special tokens or identical chunks). This is a known "
+                "failure mode — discard that output entirely. Re-orient: state "
+                "what you were trying to do in one sentence, then emit the next "
+                "concrete tool call (write_file, run_bash, or edit_file). Do not "
+                "continue the previous stream. Start fresh.")
+            return TURN_STREAM_CUT
         retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
         cut_count = reasoning_loop_cut_count
         reasoning_secs = (time.time() - reasoning_only_start) if reasoning_only_start else 0
@@ -3160,9 +3607,14 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             messages.append({"role": "user", "content":
                 "[Runtime note: You were thinking about the task above. "
                 "Your reasoning has been preserved as your previous message. "
-                "Now act on it: emit the next tool call, write the file, or "
-                "execute the approach you were planning. Do not reason further "
-                "without taking action.]"})
+                "Now act on it — do NOT continue reasoning. Concretely:\n"
+                "  • write_file: create the deliverable file the task expects "
+                "(e.g. /app/solution.py, /app/main.rs). Put your planned approach "
+                "into actual code now, even as a first draft.\n"
+                "  • run_bash: execute it to see what happens.\n"
+                "  • edit_file / write_file: fix what the run reported and re-run.\n"
+                "An imperfect file you iterate on beats a perfect plan that never "
+                "gets written. Emit the write_file or run_bash tool call now.]"})
         else:
             _nudge_current_user_turn(messages, REASONING_STALL_NUDGE)
         return TURN_STALL
@@ -4232,6 +4684,9 @@ def main():
             shown = f" as {title!r}" if title else ""
             print(f"{DIM}  ✓ saved session {session_id}{shown}{RESET}")
             continue
+        if user == "/memory" or user.startswith("/memory "):
+            _cmd_memory(messages, user)
+            continue
         if user == "/delete" or user.startswith("/delete "):
             target = user.split(None, 1)[1].strip() if " " in user else None
             _cmd_delete(target, session_id)
@@ -4618,6 +5073,245 @@ def _cmd_delete(target, current_id):
         print(f"{DIM}  ✓ deleted session {sid}{RESET}")
     else:
         print(f"{YELLOW}  ✗ couldn't delete session {sid}{RESET}")
+
+
+def _cmd_memory(messages, user_input):
+    """Handle /memory save|remember|list  — manual memories.
+
+    /memory save [focus...]      — distill session into a memory (optional focus
+                                   guidance for the model: e.g. "focus on config")
+    /memory remember <query>     — keyword search through saved memories
+    /memory list                 — list all saved memories
+    """
+    parts = user_input.split(None, 2)
+    sub = parts[1].lower() if len(parts) >= 2 else ""
+
+    if sub == "list":
+        _cmd_memory_list()
+        return
+
+    if sub == "remember":
+        query = parts[2] if len(parts) >= 3 else ""
+        _cmd_memory_remember(query)
+        return
+
+    if sub == "save":
+        notes = parts[2] if len(parts) >= 3 else None
+        _cmd_memory_save(messages, notes)
+        return
+
+    # Bare /memory — show usage
+    print(f"{DIM}  usage:{RESET}")
+    print(f"{DIM}    /memory save [focus...]   save a memory (optional focus guidance){RESET}")
+    print(f"{DIM}    /memory remember <query>   search memories{RESET}")
+    print(f"{DIM}    /memory list               list all memories{RESET}")
+
+
+def _slugify(text, maxlen=60):
+    """Turn a title into a filesystem-safe slug."""
+    s = text.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    if len(s) > maxlen:
+        s = s[:maxlen].rstrip("-")
+    return s or "untitled"
+
+
+def _cmd_memory_save(messages, notes=None):
+    """Save a memory to ~/.minion/memories/<slug>.md.
+
+    The model always distills the session into a markdown memory note.
+    ``notes``, if provided, serves as guidance: "focus on the build system",
+    "capture the API endpoint details", etc.
+    """
+    memories_dir = _memories_dir()
+    os.makedirs(memories_dir, exist_ok=True)
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    fname_stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    print(f"{DIM}  distilling session into a memory…{RESET}")
+    transcript = _render_transcript_for_memory(messages)
+
+    focus = f"\nThe user specifically asks to focus on: {notes}\n" if notes else ""
+    prompt = (
+        "You are a developer's memory-keeper. Given the following coding session transcript, "
+        "extract the key learnings, discoveries, and solutions that are worth remembering "
+        "for future work on this project. Focus on:\n"
+        "- What problem was being solved\n"
+        "- What approach worked (and what didn't)\n"
+        "- Specific file paths, commands, config values, or API quirks that were discovered\n"
+        "- Why things work the way they do (the reasoning, not just the result)\n"
+        f"{focus}"
+        "Write this as a concise, knowledge-rich markdown note that another developer "
+        "(or yourself weeks from now) can read and immediately understand. "
+        "Use backticks for code, paths, and commands. "
+        "Start with a `# Title` line that captures the topic.\n\n"
+        f"---\n{transcript}\n---"
+    )
+    try:
+        _log_event("req", {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
+                           "stream": False, "_purpose": "memory_save"})
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False, timeout=30,
+            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+        try:
+            _log_event("resp", {"_purpose": "memory_save", "data": resp.model_dump()})
+        except Exception:
+            pass
+    except APIConnectionError:
+        print(f"{RED}  ✗ can't reach {client.base_url} — memory not saved{RESET}")
+        return
+    except Exception as e:
+        print(f"{RED}  ✗ memory save failed: {type(e).__name__}: {e}{RESET}")
+        return
+
+    body = (resp.choices[0].message.content or "").strip()
+    if not body:
+        print(f"{RED}  ✗ model returned empty — memory not saved{RESET}")
+        return
+
+    # Extract title from the markdown H1
+    title = ""
+    for line in body.split("\n"):
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    if not title:
+        title = body.split("\n")[0][:80].strip() or f"Memory {fname_stamp}"
+
+    # Write the file — timestamp_slug.md so it's human-readable on the filesystem
+    slug = _slugify(title)
+    fname = f"{fname_stamp}_{slug}.md"
+    content = f"{body}\n\n---\n_Saved on {stamp}_\n"
+    path = os.path.join(memories_dir, fname)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"{DIM}  ✓ saved memory: {title}{RESET}")
+        print(f"{DIM}    {path}{RESET}")
+    except OSError as e:
+        print(f"{RED}  ✗ couldn't write memory: {e}{RESET}")
+
+
+def _cmd_memory_remember(query):
+    """Keyword-search through saved memories."""
+    memories_dir = _memories_dir()
+    if not os.path.isdir(memories_dir):
+        print(f"{DIM}  no memories saved yet{RESET}")
+        return
+
+    if not query:
+        print(f"{YELLOW}  usage: /memory remember <search terms>{RESET}")
+        return
+
+    q = query.lower()
+    files = []
+    try:
+        for name in sorted(os.listdir(memories_dir), reverse=True):
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(memories_dir, name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            if q in content.lower():
+                # Extract title from first H1 or first line
+                title = ""
+                for line in content.split("\n"):
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+                if not title:
+                    title = name
+                files.append((name, title, content))
+    except OSError:
+        print(f"{DIM}  no memories saved yet{RESET}")
+        return
+
+    if not files:
+        print(f"{DIM}  no memories matching {query!r}{RESET}")
+        return
+
+    print(f"{DIM}  memories matching {query!r}:{RESET}")
+    for name, title, content in files:
+        print(f"\n{CYAN}  ┌─ {title}{RESET}  {DIM}({name}){RESET}")
+        # Show first ~10 lines as preview, strip the title line
+        lines = content.split("\n")
+        shown = 0
+        for line in lines:
+            if line.startswith("# ") and shown == 0:
+                continue  # skip the title line in preview (already shown)
+            if shown >= 10:
+                print(f"{DIM}  │  …{RESET}")
+                break
+            print(f"{DIM}  │{RESET} {line[:100]}")
+            shown += 1
+
+
+def _cmd_memory_list():
+    """List all saved memories with titles and dates."""
+    memories_dir = _memories_dir()
+    if not os.path.isdir(memories_dir):
+        print(f"{DIM}  no memories saved yet{RESET}")
+        return
+
+    files = []
+    try:
+        for name in os.listdir(memories_dir):
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(memories_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+                with open(path, encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                title = first_line[2:] if first_line.startswith("# ") else name
+                files.append((mtime, name, title))
+            except OSError:
+                continue
+    except OSError:
+        print(f"{DIM}  no memories saved yet{RESET}")
+        return
+
+    if not files:
+        print(f"{DIM}  no memories saved yet{RESET}")
+        return
+
+    files.sort(key=lambda x: x[0], reverse=True)
+    print(f"{DIM}  memories ({len(files)}):{RESET}")
+    for i, (mtime, name, title) in enumerate(files, 1):
+        date = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        print(f"  {GREEN}{i:>2}.{RESET} {title}  {DIM}({date}){RESET}")
+
+
+def _render_transcript_for_memory(messages):
+    """Render session messages into a compact text transcript for the model.
+
+    Skips the system prompt, truncates long tool outputs, and shows tool calls.
+    """
+    out = []
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        role = m.get("role", "?")
+        content = m.get("content")
+        if content is None and m.get("tool_calls"):
+            calls = ", ".join(
+                f"{c['function']['name']}({c['function']['arguments'][:100]})"
+                for c in m["tool_calls"]
+            )
+            out.append(f"[{role}] → {calls}")
+        elif isinstance(content, list):
+            text = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+            out.append(f"[{role}] {(text or '')[:2000]}")
+        else:
+            out.append(f"[{role}] {(content or '')[:2000]}")
+    return "\n\n".join(out)
 
 
 if __name__ == "__main__":
