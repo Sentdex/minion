@@ -11,7 +11,7 @@ This presents real challenges to running coding agents on local models, where yo
 Why do we care about this context?
 1. That first 50K of context is your fastest context for your model. We want that speed.
 2. That first 50K of context is where your model's attention mechanism is likely the best. We want that intelligence.
-3. That first 50K of context riding along every singe message you send adds to cost over time, even if you're on some API.
+3. That first 50K of context riding along every single message you send adds to cost over time, even if you're on some API.
 
 On a bare `hey`, the entire prompt minion sends is about 625 tokens:
 
