@@ -3304,7 +3304,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     leaked_token_run += 1
                 else:
                     leaked_token_run = 0
-                if rc.strip():
+                if rc():
                     print(f"{DIM}{rc}{RESET}", end="", flush=True)
                     reasoning_parts.append(rc)
                 if not content and not tcs:
@@ -3382,7 +3382,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                         last_chunk = chunk
                 else:
                     repeat_chunk_run = 0
-                if chunk.strip():
+                if chunk():
                     print(chunk, end="", flush=True)
                     content.append(chunk)
                     streamed_chars += len(chunk)
