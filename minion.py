@@ -432,9 +432,15 @@ def _maybe_refresh_description(session_id, messages):
     try:
         _log_event("req", {"model": MODEL, "messages": payload,
                            "stream": False, "_purpose": "session_desc"})
+        opts = {"stream": False, "timeout": 20}
+        if MINION_TEMPERATURE is not None:
+            opts["temperature"] = MINION_TEMPERATURE
+        if MINION_TOP_P is not None:
+            opts["top_p"] = MINION_TOP_P
+        if ACTIVE:
+            opts.update(ACTIVE.extra_request_kwargs())
         resp = client.chat.completions.create(
-            model=MODEL, messages=payload, stream=False, timeout=20,
-            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+            model=MODEL, messages=payload, **opts)
         try:
             _log_event("resp", {"_purpose": "session_desc", "data": resp.model_dump()})
         except Exception:
@@ -784,12 +790,19 @@ class Source:
         if not mid:
             return None
         try:
+            opts = {
+                "max_tokens": 10_000_000,
+                "stream": False,
+                "timeout": 30,
+            }
+            if MINION_TEMPERATURE is not None:
+                opts["temperature"] = MINION_TEMPERATURE
+            if MINION_TOP_P is not None:
+                opts["top_p"] = MINION_TOP_P
             self.client.chat.completions.create(
                 model=mid,
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=10_000_000,
-                stream=False,
-                timeout=30,
+                **opts
             )
         except Exception as e:
             msg = str(e)
@@ -2224,7 +2237,33 @@ def _is_leak_chunk(chunk):
 # MINION_TOP_P is only relevant when temperature > 0; set to 1 for full
 # probability mass, or lower for nucleus sampling.
 # Set either to a negative value to omit it from the request (let the
-# server use its own default, typically temperature=1.0 / top_p=1.0).
+# server use its own default).
+# Set MINION_TEMPERATURE=MODEL or MINION_TOP_P=MODEL to use the model's
+# default instead of minion's defaults (0.7 / 0.95).
+# Default temperature 0.7 is a good balance between creativity and reliability
+# for coding tasks. Higher values (1.0+) increase hallucination risk.
+_MINION_TEMPERATURE_RAW = os.environ.get("MINION_TEMPERATURE", "0.7").strip()
+if _MINION_TEMPERATURE_RAW.lower() == "model":
+    MINION_TEMPERATURE = None  # Signal to use model's default
+else:
+    try:
+        MINION_TEMPERATURE = float(_MINION_TEMPERATURE_RAW)
+        if MINION_TEMPERATURE < 0:
+            MINION_TEMPERATURE = None  # Negative means omit, use model default
+    except ValueError:
+        MINION_TEMPERATURE = 0.7  # Fallback to sane default
+
+_MINION_TOP_P_RAW = os.environ.get("MINION_TOP_P", "0.95").strip()
+if _MINION_TOP_P_RAW.lower() == "model":
+    MINION_TOP_P = None  # Signal to use model's default
+else:
+    try:
+        MINION_TOP_P = float(_MINION_TOP_P_RAW)
+        if MINION_TOP_P < 0:
+            MINION_TOP_P = None  # Negative means omit, use model default
+    except ValueError:
+        MINION_TOP_P = 0.95  # Fallback to sane default
+
 RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
 RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
@@ -2455,9 +2494,15 @@ def _assess_risk(action):
                                        "stream": False, "_purpose": "risk",
                                        "_attempt": conn_attempt + 1,
                                        "_parse_attempt": parse_attempt + 1})
+                    opts = {"stream": False, "timeout": 15}
+                    if MINION_TEMPERATURE is not None:
+                        opts["temperature"] = MINION_TEMPERATURE
+                    if MINION_TOP_P is not None:
+                        opts["top_p"] = MINION_TOP_P
+                    if ACTIVE:
+                        opts.update(ACTIVE.extra_request_kwargs())
                     resp = client.chat.completions.create(
-                        model=MODEL, messages=payload, stream=False, timeout=15,
-                        **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+                        model=MODEL, messages=payload, **opts)
                     break
                 except APIConnectionError:
                     if conn_attempt >= max_conn - 1:
@@ -2824,6 +2869,13 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
             request_opts["max_tokens"] = token_limit
         if recovery_sampling:
             request_opts.update(_recovery_sampling_opts())
+        # Add default temperature and top_p (unless explicitly set by recovery_sampling)
+        if "temperature" not in request_opts:
+            if MINION_TEMPERATURE is not None:
+                request_opts["temperature"] = MINION_TEMPERATURE
+        if "top_p" not in request_opts:
+            if MINION_TOP_P is not None:
+                request_opts["top_p"] = MINION_TOP_P
         if tool_choice is not None:
             request_opts["tool_choice"] = tool_choice
         # Per-request body fields (e.g. OpenRouter provider routing) ride in
@@ -2976,9 +3028,15 @@ def compress(messages, keep=COMPRESS_KEEP, auto=False):
     payload = [{"role": "user", "content": summary_prompt}]
     try:
         _log_event("req", {"model": MODEL, "messages": payload, "stream": False, "_purpose": "compress"})
+        opts = {"stream": False}
+        if MINION_TEMPERATURE is not None:
+            opts["temperature"] = MINION_TEMPERATURE
+        if MINION_TOP_P is not None:
+            opts["top_p"] = MINION_TOP_P
+        if ACTIVE:
+            opts.update(ACTIVE.extra_request_kwargs())
         resp = client.chat.completions.create(
-            model=MODEL, messages=payload, stream=False,
-            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+            model=MODEL, messages=payload, **opts)
         try:
             _log_event("resp", {"_purpose": "compress", "data": resp.model_dump()})
         except Exception:
@@ -5152,11 +5210,17 @@ def _cmd_memory_save(messages, notes=None):
     try:
         _log_event("req", {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
                            "stream": False, "_purpose": "memory_save"})
+        opts = {"stream": False, "timeout": 30}
+        if MINION_TEMPERATURE is not None:
+            opts["temperature"] = MINION_TEMPERATURE
+        if MINION_TOP_P is not None:
+            opts["top_p"] = MINION_TOP_P
+        if ACTIVE:
+            opts.update(ACTIVE.extra_request_kwargs())
         resp = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            stream=False, timeout=30,
-            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
+            **opts)
         try:
             _log_event("resp", {"_purpose": "memory_save", "data": resp.model_dump()})
         except Exception:
