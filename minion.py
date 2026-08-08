@@ -1565,7 +1565,7 @@ def _run_bash(command):
     # Inline: run the command in a subshell, then echo its exit status.
     # setsid detaches into a new session so terminal Ctrl+C / SIGINT can't
     # reach the background job. Redirect to the log file ourselves.
-    inner = f"({command}); echo \"[exit: $?]\""
+    inner = f"({command}\n); echo \"[exit: $?]\""
     wrapped = (f"setsid sh -c {shlex.quote(inner)} > {shlex.quote(log_path)} 2>&1 < /dev/null &\n"
                f"echo $!")
     r = subprocess.run(wrapped, shell=True, capture_output=True, text=True)
