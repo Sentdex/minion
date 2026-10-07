@@ -34,9 +34,16 @@ def _write(name, text):
     return path
 
 
+_REAL_CONFIRM = m._confirm
+
+
 def _allow_edits():
     """Make _confirm auto-approve so edit_file writes without prompting."""
-    m._confirm = lambda action: True
+    m._confirm = lambda action, **_: True
+
+
+def teardown_function(_function):
+    m._confirm = _REAL_CONFIRM  # don't leak the stub into later test modules
 
 
 def test_small_file_numbered_no_header():
@@ -102,6 +109,17 @@ def test_limit_zero_reads_to_end():
     # whole file -> no header, 50 numbered lines
     assert not out.startswith("[")
     assert len(out.splitlines()) == 50
+
+
+def test_limit_zero_still_char_bounded(monkeypatch):
+    # limit<=0 reads to the end by lines, but the char budget still applies
+    # and points at where to continue.
+    monkeypatch.setenv("MINION_READ_FILE_CHARS", "2000")
+    path = _write("wide4.txt", "".join("z" * 99 + "\n" for _ in range(100)))
+    out = m.read_file(path, limit=0)
+    header = out.split("\n", 1)[0]
+    assert header.startswith(f"[{path}: lines 1-")
+    assert "next: read_file(" in header and "offset=" in header
 
 
 def test_line_number_matches_real_position():

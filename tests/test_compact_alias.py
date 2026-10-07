@@ -28,7 +28,7 @@ class FakeStream:
 def fake_open_stream(msgs):
     return FakeStream()
 
-def fake_compress(msgs, keep=m.COMPRESS_KEEP):
+def fake_compress(msgs, keep=m.COMPRESS_KEEP, **_):
     # pretend we summarized 3 turns into 1, kept 2 verbatim, summary = 42 chars
     msgs[:] = [{"role": "system", "content": m.SYSTEM},
                {"role": "user", "content": "[Compressed context — 3 earlier turns summarized; last 2 turns kept verbatim]\n\nfake"}]

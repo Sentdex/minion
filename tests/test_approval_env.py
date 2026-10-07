@@ -166,3 +166,27 @@ def test_open_stream_only_sets_sampler_params_for_recovery():
             m.RECOVERY_TEMPERATURE,
             m.RECOVERY_TOP_P,
         ) = saved
+
+
+def test_level_high_skips_classifier_but_protected_still_prompts(tmp_path):
+    m = reload_minion(env={"MINION_APPROVAL": "high"})
+    saved = (m.client, m._ask_approval)
+    prompts = []
+
+    def create(**_):
+        raise AssertionError("classifier must not be called at level high")
+
+    def ask(prompt, default="y"):
+        prompts.append(prompt)
+        return "n"
+    try:
+        m.client = types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=create)))
+        m._ask_approval = ask
+        assert m._confirm("run: ls") is True
+        assert prompts == []
+        assert m._confirm(f"write {tmp_path / '.env'} (3 bytes)") is False
+        assert prompts and "[PROTECTED" in prompts[0]
+    finally:
+        m.client, m._ask_approval = saved
+        reload_minion()  # don't leak level=high into later test modules
