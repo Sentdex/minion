@@ -111,7 +111,7 @@ _compress_calls = []
 
 # A stub compress used by Tests 3–5. It records (keep, auto) and mimics the
 # keep-count logic so _maybe_autocompress's return value is realistic.
-def _stub_compress(msgs, keep=m.COMPRESS_KEEP, auto=False):
+def _stub_compress(msgs, keep=m.COMPRESS_KEEP, auto=False, **_):
     _compress_calls.append((keep, auto))
     sys_msg = msgs[0] if msgs and msgs[0].get("role") == "system" else None
     body = msgs[1:] if sys_msg else msgs

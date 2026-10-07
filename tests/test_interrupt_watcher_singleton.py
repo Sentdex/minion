@@ -184,3 +184,40 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             setup_function(fn)
             fn()
+
+def test_esc_during_poll_interrupts(monkeypatch):
+    """_poll_pid(check_esc=True) arms the watcher for the wait; an Esc seen
+    while armed returns 'interrupted' and leaves both flags clear."""
+    import subprocess
+    monkeypatch.setattr(m, "_esc_watch_available", lambda: True)
+    monkeypatch.setattr(m, "_ensure_interrupt_watcher", lambda: None)
+    proc = subprocess.Popen(["sleep", "10"])
+    out = {}
+    try:
+        t = threading.Thread(target=lambda: out.setdefault(
+            "status", m._poll_pid(proc.pid, 10, check_esc=True)))
+        t.start()
+        for _ in range(200):
+            if m._INTERRUPT_ARMED.is_set():
+                break
+            threading.Event().wait(0.01)
+        assert m._INTERRUPT_ARMED.is_set(), "watcher not armed while polling"
+        m._USER_INTERRUPTED.set()  # the watcher saw Esc
+        m._INTERRUPT_RESTORED.set()  # the watcher restored termios on disarm
+        t.join(5)
+        assert out.get("status") == "interrupted", out
+        assert not m._USER_INTERRUPTED.is_set(), "stale Esc survived the poll"
+        assert not m._INTERRUPT_ARMED.is_set(), "watcher left armed after poll"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_poll_without_tty_does_not_arm(monkeypatch):
+    monkeypatch.setattr(m, "_esc_watch_available", lambda: False)
+    seen = []
+    real_loop = m._poll_pid_loop
+    monkeypatch.setattr(m, "_poll_pid_loop", lambda *a: (
+        seen.append(m._INTERRUPT_ARMED.is_set()), real_loop(*a))[1])
+    assert m._poll_pid(2**22 + 12345, 1, check_esc=True) == "exited"
+    assert seen == [False]

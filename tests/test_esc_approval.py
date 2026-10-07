@@ -44,8 +44,8 @@ def setup_function(_function):
 # ---------------------------------------------------------------------------
 def test_confirm_esc_raises():
     saved_ask, saved_assess = m._ask_approval, m._assess_risk
-    m._ask_approval = lambda prompt: "esc"
-    m._assess_risk = lambda action: ("high", "because test")
+    m._ask_approval = lambda prompt, default="y": "esc"
+    m._assess_risk = lambda action, payload=None: ("high", "because test")
     try:
         try:
             m._confirm("write foo.py (10 bytes)")
@@ -62,12 +62,12 @@ def test_confirm_esc_raises():
 # ---------------------------------------------------------------------------
 def test_confirm_y_n():
     saved_ask, saved_assess = m._ask_approval, m._assess_risk
-    m._assess_risk = lambda action: ("high", "because test")
+    m._assess_risk = lambda action, payload=None: ("high", "because test")
     builtins.print = lambda *a, **k: None  # hush
     try:
-        m._ask_approval = lambda prompt: "y"
+        m._ask_approval = lambda prompt, default="y": "y"
         assert m._confirm("write foo.py") is True
-        m._ask_approval = lambda prompt: "n"
+        m._ask_approval = lambda prompt, default="y": "n"
         assert m._confirm("write foo.py") is False
     finally:
         m._ask_approval, m._assess_risk = saved_ask, saved_assess
@@ -81,7 +81,7 @@ def test_confirm_y_n():
 def test_run_tool_propagates_esc():
     saved_confirm = m._confirm
     # make write_file's _confirm raise
-    m._confirm = lambda action: (_ for _ in ()).throw(m._EscToChat(action))
+    m._confirm = lambda action, **_: (_ for _ in ()).throw(m._EscToChat(action))
     builtins.print = lambda *a, **k: None
     # suppress the spinner so we don't spawn a thread
     m.LifeSpinner = type("NoSpinner", (), {
@@ -160,7 +160,7 @@ def test_model_turn_native_esc():
     ]
     m.open_stream = lambda messages, **kw: iter(chunks)
     # Esc on the FIRST tool; the second should be skipped, not re-prompted.
-    m._confirm = lambda action: (_ for _ in ()).throw(m._EscToChat(action))
+    m._confirm = lambda action, **_: (_ for _ in ()).throw(m._EscToChat(action))
     try:
         messages = [{"role": "system", "content": m.SYSTEM},
                     {"role": "user", "content": "do it"}]
@@ -212,7 +212,7 @@ def test_model_turn_malformed_native_tool_args_retries_cleanly():
         _FakeChunk(_FakeDelta(tool_calls=[
             _FakeTC(0, "call_bad", "write_file",
                     '{"path":"big.html","content":"unterminated')
-        ]), finish_reason="length"),
+        ]), finish_reason="tool_calls"),  # length cuts have their own test below
     ]
     m.open_stream = lambda messages, **kw: iter(chunks)
     m.run_tool = lambda *a, **k: (_ for _ in ()).throw(
@@ -232,6 +232,75 @@ def test_model_turn_malformed_native_tool_args_retries_cleanly():
         m.run_tool = saved_run_tool
         builtins.print = _REAL_PRINT
     print("PASS — malformed native tool args retry cleanly without executing {}")
+
+
+# ---------------------------------------------------------------------------
+# 5b. A response cut at finish_reason=length never runs its tool calls, even
+#     when their JSON parses; a missing tool-call id is synthesized.
+# ---------------------------------------------------------------------------
+def test_model_turn_length_cut_valid_tool_call_not_executed():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    saved_run_tool = m.run_tool
+    m._interrupt_watcher = lambda: None
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    chunks = [
+        _FakeChunk(_FakeDelta(tool_calls=[
+            _FakeTC(0, None, "write_file", '{"path":"half.py","content":"def f():"}')
+        ]), finish_reason="length"),
+    ]
+    m.open_stream = lambda messages, **kw: iter(chunks)
+    m.run_tool = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("length-cut tool calls must not execute"))
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "write a file"}]
+        status = m.model_turn(messages)
+        assert status == m.TURN_STREAM_CUT, f"expected TURN_STREAM_CUT, got {status!r}"
+        assert len(messages) == 2, f"assistant/tool history leaked: {messages!r}"
+        assert "output token limit" in messages[-1]["content"]
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        m.run_tool = saved_run_tool
+        builtins.print = _REAL_PRINT
+
+
+def test_model_turn_synthesizes_missing_tool_call_ids():
+    saved_open_stream = m.open_stream
+    saved_watcher = m._interrupt_watcher
+    saved_spinner = m.LifeSpinner
+    saved_run_tool = m.run_tool
+    m._interrupt_watcher = lambda: None
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    chunks = [_FakeChunk(_FakeDelta(tool_calls=[_FakeTC(0, None, "list_dir", '{}')]))]
+    m.open_stream = lambda messages, **kw: iter(chunks)
+    m.run_tool = lambda *a, **k: "ok"
+    try:
+        messages = [{"role": "user", "content": "ls"}]
+        assert m.model_turn(messages) == m.TURN_TOOL
+        assert messages[1]["tool_calls"][0]["id"] == "call_0"
+        assert messages[2]["tool_call_id"] == "call_0"
+    finally:
+        m.open_stream = saved_open_stream
+        m._interrupt_watcher = saved_watcher
+        m.LifeSpinner = saved_spinner
+        m.run_tool = saved_run_tool
+        builtins.print = _REAL_PRINT
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +353,12 @@ def test_reasoning_only_stall_requests_forced_final():
     saved_watcher = m._interrupt_watcher
     saved_spinner = m.LifeSpinner
     saved_limit = m.REASONING_ONLY_CHAR_LIMIT
+    saved_retries = m.REASONING_ONLY_RETRY_LIMIT
     m._interrupt_watcher = lambda: None
     m.REASONING_ONLY_CHAR_LIMIT = 3
+    # Default is 3 (two-tier: early stalls nudge to act, the last forces a
+    # final). Pin to 1 so this first stall IS the last retry.
+    m.REASONING_ONLY_RETRY_LIMIT = 1
     m.LifeSpinner = type("NoSpinner", (), {
         "__init__": lambda self, **kw: None,
         "start": lambda self: None,
@@ -306,8 +379,38 @@ def test_reasoning_only_stall_requests_forced_final():
         m._interrupt_watcher = saved_watcher
         m.LifeSpinner = saved_spinner
         m.REASONING_ONLY_CHAR_LIMIT = saved_limit
+        m.REASONING_ONLY_RETRY_LIMIT = saved_retries
         builtins.print = _REAL_PRINT
     print("PASS — reasoning-only stall requests forced final answer")
+
+
+def test_reasoning_only_first_stall_nudges_to_act_generically():
+    # With the default two-tier limit, the first stall nudges to ACT (full
+    # tools) rather than forcing a final, and the nudge has no /app/ paths.
+    saved = (m.open_stream, m._interrupt_watcher, m.LifeSpinner,
+             m.REASONING_ONLY_CHAR_LIMIT, m.REASONING_ONLY_RETRY_LIMIT)
+    m._interrupt_watcher = lambda: None
+    m.REASONING_ONLY_CHAR_LIMIT = 3
+    m.REASONING_ONLY_RETRY_LIMIT = 3
+    m.LifeSpinner = type("NoSpinner", (), {
+        "__init__": lambda self, **kw: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+        "_t": None,
+    })
+    builtins.print = lambda *a, **k: None
+    m.open_stream = lambda messages, **kw: iter([_FakeChunk(_FakeDelta(reasoning="abcd"))])
+    try:
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages)
+        assert status == m.TURN_STALL, f"expected TURN_STALL, got {status!r}"
+        assert messages[-1]["content"] == m.REASONING_STALL_CONTINUE_NOTE
+        assert "/app/" not in messages[-1]["content"]
+    finally:
+        (m.open_stream, m._interrupt_watcher, m.LifeSpinner,
+         m.REASONING_ONLY_CHAR_LIMIT, m.REASONING_ONLY_RETRY_LIMIT) = saved
+        builtins.print = _REAL_PRINT
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +497,10 @@ def test_reasoning_only_empty_completion_forces_final_without_empty_assistant():
     m._interrupt_watcher = lambda: None
     m.REASONING_ONLY_CHAR_LIMIT = 9999
     m.REASONING_ONLY_RETRY_LIMIT = 1
+    # Reasoning capture (default on) deliberately re-feeds reasoning as an
+    # assistant message; turn it off to test the no-capture path.
+    saved_capture = m.REASONING_CAPTURE_CHARS
+    m.REASONING_CAPTURE_CHARS = 0
     m.LifeSpinner = type("NoSpinner", (), {
         "__init__": lambda self, **kw: None,
         "start": lambda self: None,
@@ -412,7 +519,17 @@ def test_reasoning_only_empty_completion_forces_final_without_empty_assistant():
         assert messages[-1]["role"] == "user"
         assert "complete visible answer" in messages[-1]["content"]
         assert not any(msg.get("role") == "assistant" for msg in messages)
+        # With capture on, the only assistant message is the non-empty reasoning.
+        m.REASONING_CAPTURE_CHARS = 8000
+        messages = [{"role": "system", "content": m.SYSTEM},
+                    {"role": "user", "content": "answer me"}]
+        status = m.model_turn(messages)
+        assert status == m.TURN_FORCE_FINAL
+        assert "complete visible answer" in messages[-1]["content"]
+        assert all(msg["content"].strip() for msg in messages
+                   if msg.get("role") == "assistant")
     finally:
+        m.REASONING_CAPTURE_CHARS = saved_capture
         m.open_stream = saved_open_stream
         m._interrupt_watcher = saved_watcher
         m.LifeSpinner = saved_spinner
@@ -457,6 +574,105 @@ def test_repl_recover_command_forces_visible_checkpoint():
     print("PASS — /recover forces a low-temp visible checkpoint")
 
 
+# ---------------------------------------------------------------------------
+# Approval prompt fails closed (non-TTY line mode, raw TTY mode, Ctrl-C)
+# ---------------------------------------------------------------------------
+def _with_input(fn, value):
+    saved = builtins.input
+
+    def fake_input(prompt=""):
+        if isinstance(value, BaseException):
+            raise value
+        return value
+    builtins.input = fake_input
+    try:
+        return fn()
+    finally:
+        builtins.input = saved
+
+
+def test_ask_approval_non_tty_fails_closed():
+    ask = m._ask_approval
+    assert _with_input(lambda: ask("? ", default="n"), "") == "n"
+    assert _with_input(lambda: ask("? ", default="n"), "maybe") == "n"
+    assert _with_input(lambda: ask("? ", default="y"), "maybe") == "n"
+    # a stray blank line from a pipe never approves, whatever the default
+    assert _with_input(lambda: ask("? ", default="y"), "") == "n"
+    assert _with_input(lambda: ask("? ", default="y"), "yes") == "y"
+    assert _with_input(lambda: ask("? ", default="n"), EOFError()) == "n"
+    assert _with_input(lambda: ask("? ", default="n"), "y") == "y"
+    assert _with_input(lambda: ask("? ", default="n"), "yes") == "y"
+    assert _with_input(lambda: ask("? ", default="n"), "esc") == "esc"
+    try:
+        _with_input(lambda: ask("? "), KeyboardInterrupt())
+    except m._EscToChat:
+        pass
+    else:
+        raise AssertionError("Ctrl-C at the prompt must raise _EscToChat")
+
+
+def test_confirm_high_risk_defaults_to_deny():
+    saved_ask, saved_assess = m._ask_approval, m._assess_risk
+    seen = {}
+
+    def ask(prompt, default="y"):
+        seen["prompt"], seen["default"] = prompt, default
+        return default  # user just hit Enter
+    m._ask_approval = ask
+    builtins.print = lambda *a, **k: None
+    try:
+        m._assess_risk = lambda action, payload=None: ("high", "rm -rf")
+        assert m._confirm("run: rm -rf x") is False
+        assert seen["default"] == "n" and "[y/N/esc]" in seen["prompt"]
+        m._assess_risk = lambda action, payload=None: ("medium", "edit")
+        assert m._confirm("write foo.py") is True
+        assert seen["default"] == "y" and "[Y/n/esc]" in seen["prompt"]
+    finally:
+        m._ask_approval, m._assess_risk = saved_ask, saved_assess
+        builtins.print = _REAL_PRINT
+
+
+def _ask_on_pty(feed, default):
+    """Drive the raw-mode prompt through a pty; `feed` is [(delay, bytes)]."""
+    import io
+    import pty
+    import threading
+    import time as _time
+    import termios
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~termios.ECHO  # nobody reads master: echo would block TCSADRAIN
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    stdin = os.fdopen(slave, "r")
+
+    class _TTYOut(io.StringIO):
+        def isatty(self):
+            return True
+
+    def writer():
+        for delay, data in feed:
+            _time.sleep(delay)
+            os.write(master, data)
+    saved_in, saved_out = sys.stdin, sys.stdout
+    sys.stdin, sys.stdout = stdin, _TTYOut()
+    t = threading.Thread(target=writer, daemon=True)
+    try:
+        os.write(master, b"y")  # type-ahead before the prompt: must be flushed
+        t.start()
+        return m._ask_approval("? ", default=default)
+    finally:
+        sys.stdin, sys.stdout = saved_in, saved_out
+        t.join(2)
+        stdin.close()
+        os.close(master)
+
+
+def test_ask_approval_tty_ignores_typeahead_unknown_keys_and_sequences():
+    # stray key and an arrow-key sequence re-prompt; Enter takes the default
+    assert _ask_on_pty([(0.2, b"x"), (0.2, b"\x1b[A"), (0.3, b"\r")], "n") == "n"
+    assert _ask_on_pty([(0.2, b"?"), (0.2, b"Y")], "n") == "y"
+
+
 if __name__ == "__main__":
     test_confirm_esc_raises()
     test_confirm_y_n()
@@ -469,4 +685,7 @@ if __name__ == "__main__":
     test_forced_final_length_marks_partial_answer()
     test_reasoning_only_empty_completion_forces_final_without_empty_assistant()
     test_repl_recover_command_forces_visible_checkpoint()
+    test_ask_approval_non_tty_fails_closed()
+    test_confirm_high_risk_defaults_to_deny()
+    test_ask_approval_tty_ignores_typeahead_unknown_keys_and_sequences()
     print("\nALL ESC-APPROVAL TESTS PASSED")

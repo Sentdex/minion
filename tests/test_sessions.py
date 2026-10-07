@@ -279,6 +279,92 @@ def test_cli_sessions_list_and_filter():
     print("PASS — `sessions` lists, filters, and exits cleanly")
 
 
+# --- tool-pair repair on resume (plan 4.3) -----------------------------------
+def _asst_calls(*ids):
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": i, "type": "function", "function": {"name": "list_dir", "arguments": "{}"}}
+        for i in ids]}
+
+
+def _tool(i, content="ok"):
+    return {"role": "tool", "tool_call_id": i, "content": content}
+
+
+def test_repair_inserts_missing_result():
+    msgs = [_msg("user", "go"), _asst_calls("a", "b"), _tool("a")]
+    assert m._repair_tool_pairs(msgs) == 1
+    assert [x.get("tool_call_id") for x in msgs[2:]] == ["a", "b"]
+    assert msgs[3]["content"] == m.TOOL_OUTCOME_UNKNOWN
+
+
+def test_repair_drops_orphan_and_duplicate():
+    msgs = [_msg("user", "go"), _tool("ghost"), _asst_calls("a"), _tool("a"),
+            _tool("a", "dup"), _tool("zzz")]
+    assert m._repair_tool_pairs(msgs) == 3
+    assert msgs == [_msg("user", "go"), _asst_calls("a"), _tool("a")]
+
+
+def test_repair_turns_pending_into_outcome_unknown():
+    msgs = [_asst_calls("a"), _tool("a", m.TOOL_PENDING),
+            _msg("user", f"Observation (run_bash): {m.TOOL_PENDING}")]
+    assert m._repair_tool_pairs(msgs) == 2
+    assert msgs[1]["content"] == m.TOOL_OUTCOME_UNKNOWN
+    assert m.TOOL_PENDING not in msgs[2]["content"]
+
+
+def test_repair_leaves_valid_history_unchanged():
+    msgs = [{"role": "system", "content": "s"}, _msg("user", "go"),
+            _asst_calls("a", "b"), _tool("a"), _tool("b"), _msg("assistant", "done")]
+    before = [dict(x) for x in msgs]
+    assert m._repair_tool_pairs(msgs) == 0
+    assert msgs == before
+
+
+def test_session_messages_repairs_on_resume():
+    sid = "20250101-140000-rep000"
+    m._write_session(sid, [_msg("user", "go"), _asst_calls("a"), _tool("a", m.TOOL_PENDING)])
+    msgs = m._session_messages(sid)
+    assert msgs[-1]["content"] == m.TOOL_OUTCOME_UNKNOWN
+
+
+# --- snapshot durability (plan 4.7) ------------------------------------------
+def test_failed_dump_keeps_old_file_and_no_tmp(monkeypatch):
+    sid = "20250101-150000-dur000"
+    m._write_session(sid, [_msg("user", "keep me")])
+    real_dump = json.dump
+
+    def exploding_dump(obj, f, **kw):
+        f.write('{"id": "half')  # partial write, then crash
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(m.json, "dump", exploding_dump)
+    try:
+        m._write_session(sid, [_msg("user", "new")])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("dump failure was swallowed")
+    monkeypatch.setattr(m.json, "dump", real_dump)
+    loaded = m._load_session(sid)
+    assert loaded and loaded["messages"] == [_msg("user", "keep me")]
+    assert not [f for f in os.listdir(m._sessions_dir()) if f.endswith(".tmp")]
+
+
+def test_corrupt_session_is_moved_aside(capsys):
+    sid = "20250101-160000-bad000"
+    path = m._session_path(sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("{not json")
+    assert m._load_session(sid) is None
+    assert os.path.exists(path + ".corrupt")
+    assert not os.path.exists(path)
+    assert "corrupt" in capsys.readouterr().out
+    # A later save starts fresh instead of clobbering the evidence.
+    m._write_session(sid, [_msg("user", "fresh")])
+    with open(path + ".corrupt") as f:
+        assert f.read() == "{not json"
+
+
 if __name__ == "__main__":
     test_write_load_roundtrip()
     test_write_session_prunes_empty_assistant_messages()
